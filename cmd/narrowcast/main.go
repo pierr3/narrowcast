@@ -431,6 +431,14 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				_ = conn.SendDatagram(statusDgram)
 			}
 
+			// Squelch gate: skip audio when signal is below threshold
+			state.mu.RLock()
+			squelchThreshold := state.squelchDb
+			state.mu.RUnlock()
+			if signalPowerDb < squelchThreshold {
+				continue
+			}
+
 			// Normalize audio level
 			var maxAbs float64
 			for _, s := range audioSamples {
