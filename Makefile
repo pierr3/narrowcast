@@ -1,11 +1,17 @@
+UNAME_S := $(shell uname -s)
+
 .PHONY: build build-pi run clean certs
 
-# Build for local machine (macOS w/ Homebrew)
+# Build for current platform
 build:
+ifeq ($(UNAME_S),Darwin)
 	CGO_CFLAGS="-I/opt/homebrew/include" CGO_LDFLAGS="-L/opt/homebrew/lib" \
 		go build -o bin/narrowcast ./cmd/narrowcast
+else
+	go build -o bin/narrowcast ./cmd/narrowcast
+endif
 
-# Cross-compile for Raspberry Pi (64-bit)
+# Cross-compile for Raspberry Pi (64-bit) from macOS
 build-pi:
 	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
 		go build -o bin/narrowcast-arm64 ./cmd/narrowcast
