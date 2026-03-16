@@ -252,23 +252,37 @@ type dspChain struct {
 func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*dspChain, error) {
 	channelBW := mode.ChannelBandwidth()
 	audioRate := mode.AudioRate()
-	decimation := sampleRate / (channelBW * 2)
-	if decimation < 1 {
-		decimation = 1
+
+	// Total decimation must be exact: sampleRate / totalDecim = audioRate
+	totalDecim := sampleRate / audioRate
+
+	// Minimum xlating decimation to satisfy Nyquist for the channel bandwidth
+	minXlatDecim := sampleRate / (channelBW * 2)
+	if minXlatDecim < 1 {
+		minXlatDecim = 1
 	}
-	decimatedRate := float64(sampleRate) / float64(decimation)
+
+	// Find smallest divisor of totalDecim >= minXlatDecim
+	xlatDecim := minXlatDecim
+	for totalDecim%xlatDecim != 0 {
+		xlatDecim++
+	}
+	audioDecim := totalDecim / xlatDecim
+	if audioDecim < 1 {
+		audioDecim = 1
+	}
+
+	decimatedRate := float64(sampleRate) / float64(xlatDecim)
 
 	numTaps := 53*sampleRate/(22*channelBW) | 1
 	if numTaps > 511 {
 		numTaps = 511
 	}
 	lpfTaps := dsp.NewLowPassFIR(float64(channelBW)/2, float64(sampleRate), numTaps)
-	xlat := dsp.NewXlatingFilter(0, lpfTaps, decimation, float64(sampleRate))
+	xlat := dsp.NewXlatingFilter(0, lpfTaps, xlatDecim, float64(sampleRate))
 
-	audioDecim := int(decimatedRate) / audioRate
-	if audioDecim < 1 {
-		audioDecim = 1
-	}
+	log.Printf("[dsp] mode=%s xlatDecim=%d audioDecim=%d decimatedRate=%.0f audioRate=%d",
+		mode, xlatDecim, audioDecim, decimatedRate, audioRate)
 
 	var demodFn func([]complex128) []float64
 	var deemph *dsp.DeEmphasis
