@@ -39,6 +39,12 @@ func run(ctx context.Context, cfg *config.Config) error {
 	if cfg.Simulate {
 		dev = sdr.OpenSimulated(cfg.SampleRate, cfg.FrequencyHz)
 		log.Printf("[narrowcast] using SIMULATED SDR device")
+	} else if cfg.DeviceSerial != "" {
+		realDev, err := sdr.OpenBySerial(cfg.DeviceSerial, cfg.SampleRate, cfg.FrequencyHz)
+		if err != nil {
+			return fmt.Errorf("sdr: %w", err)
+		}
+		dev = realDev
 	} else {
 		realDev, err := sdr.Open(cfg.DeviceIndex, cfg.SampleRate, cfg.FrequencyHz)
 		if err != nil {

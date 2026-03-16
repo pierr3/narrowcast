@@ -18,6 +18,16 @@ type Device struct {
 	CenterFreq uint64
 }
 
+// OpenBySerial opens an RTL-SDR device matching the given serial string.
+func OpenBySerial(serial string, sampleRate int, centerFreq uint64) (*Device, error) {
+	index, err := rtl.GetIndexBySerial(serial)
+	if err != nil {
+		return nil, fmt.Errorf("rtlsdr lookup serial %q: %w", serial, err)
+	}
+	log.Printf("[sdr] serial %q resolved to device index %d", serial, index)
+	return Open(index, sampleRate, centerFreq)
+}
+
 // Open opens RTL-SDR device at the given index.
 func Open(index int, sampleRate int, centerFreq uint64) (*Device, error) {
 	dev, err := rtl.Open(index)

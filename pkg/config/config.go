@@ -17,6 +17,7 @@ type Config struct {
 	Simulate      bool
 	SampleRate    int
 	DeviceIndex   int
+	DeviceSerial  string
 	TunerGainAuto bool
 	TunerGain     float64
 
@@ -59,6 +60,7 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.Simulate, "simulate", c.Simulate, "Use simulated SDR (no hardware needed)")
 	fs.IntVar(&c.SampleRate, "samplerate", c.SampleRate, "RTL-SDR sample rate")
 	fs.IntVar(&c.DeviceIndex, "device", c.DeviceIndex, "RTL-SDR device index")
+	fs.StringVar(&c.DeviceSerial, "serial", c.DeviceSerial, "RTL-SDR device serial (overrides --device)")
 	fs.IntVar(&c.FFTSize, "fftsize", c.FFTSize, "FFT bin count")
 	fs.IntVar(&c.FFTRate, "fftrate", c.FFTRate, "FFT frames per second")
 	fs.IntVar(&c.OpusBitrate, "opus-bitrate", c.OpusBitrate, "Opus encoder bitrate (bps)")
