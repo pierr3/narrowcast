@@ -1,6 +1,6 @@
 UNAME_S := $(shell uname -s)
 
-.PHONY: build build-pi run clean certs
+.PHONY: build build-relay build-pi run clean certs
 
 # Build for current platform
 build:
@@ -10,6 +10,10 @@ ifeq ($(UNAME_S),Darwin)
 else
 	go build -o bin/narrowcast ./cmd/narrowcast
 endif
+
+# Build relay (pure Go, no CGO needed)
+build-relay:
+	CGO_ENABLED=0 go build -o bin/relay ./cmd/relay
 
 # Cross-compile for Raspberry Pi (64-bit) from macOS
 build-pi:

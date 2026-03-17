@@ -69,6 +69,18 @@ const (
 	// CmdWelcome is sent by the server in response to Hello.
 	// Payload: [uint8 protoVersion][uint64 minFreqHz][uint64 maxFreqHz][uint32 sampleRate]
 	CmdWelcome byte = 0x31
+
+	// CmdAuth is sent by the client before Hello when connecting via relay.
+	// Payload: [32 bytes SHA-256 hash of password]
+	CmdAuth byte = 0x32
+
+	// CmdAuthOK is sent by the relay to confirm successful auth.
+	// Payload: none.
+	CmdAuthOK byte = 0x33
+
+	// CmdAuthFail is sent by the relay on bad password.
+	// Payload: none.
+	CmdAuthFail byte = 0x34
 )
 
 const ProtoVersion = 1
