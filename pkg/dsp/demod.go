@@ -174,6 +174,27 @@ func (f *HighPassIIR) Process(samples []float64) {
 	}
 }
 
+// SoftLimiter applies tanh-based soft clipping to prevent harsh distortion
+// from ADC saturation on strong signals. Compresses loud signals smoothly
+// instead of hard-clipping.
+type SoftLimiter struct {
+	drive float64 // controls compression knee (higher = more compression)
+}
+
+// NewSoftLimiter creates a soft limiter.
+// drive controls how aggressively signals are compressed.
+// 1.0 = gentle, 2.0 = moderate, 3.0+ = heavy compression.
+func NewSoftLimiter(drive float64) *SoftLimiter {
+	return &SoftLimiter{drive: drive}
+}
+
+// Process applies soft limiting in-place.
+func (l *SoftLimiter) Process(samples []float64) {
+	for i, s := range samples {
+		samples[i] = math.Tanh(s * l.drive) / math.Tanh(l.drive)
+	}
+}
+
 // AGC implements automatic gain control with separate attack/release smoothing.
 // Uses RMS-based level detection and logarithmic gain computation.
 type AGC struct {

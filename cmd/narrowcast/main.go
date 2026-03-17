@@ -248,6 +248,7 @@ type dspChain struct {
 	voiceHPF    *dsp.HighPassIIR    // voice bandpass high-pass (AM only)
 	voiceLPF    *dsp.RealFIRFilter  // voice bandpass low-pass (AM only)
 	noiseGate   *dsp.NoiseGate      // soft noise gate (AM only)
+	limiter     *dsp.SoftLimiter     // soft clipper for ADC saturation
 	agc         *dsp.AGC            // automatic gain control
 	opusEnc     *audio.OpusEncoder
 	audioRate   int
@@ -335,6 +336,9 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		log.Printf("[dsp] AM voice cleanup: bandpass 300-3000 Hz + noise gate")
 	}
 
+	// Soft limiter to tame ADC-saturated signals (drive=2.0 = moderate compression)
+	limiter := dsp.NewSoftLimiter(2.0)
+
 	// Slow AGC: -12 dBFS target, max 30 dB gain, 20ms attack, 500ms release
 	agc := dsp.NewAGC(-12, 30, 20, 500, float64(audioRate))
 
@@ -350,6 +354,7 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		audioDecimF: audioDecimF,
 		voiceHPF:    voiceHPF,
 		voiceLPF:    voiceLPF,
+		limiter:     limiter,
 		agc:         agc,
 		noiseGate:   noiseGate,
 		opusEnc:     opusEnc,
@@ -442,6 +447,9 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 			}
 
 			audioSamples := chain.demodFn(channelIQ)
+
+			// Soft limit to compress ADC-saturated signals
+			chain.limiter.Process(audioSamples)
 
 			// Anti-aliased audio decimation to target rate
 			if chain.audioDecimF != nil {
