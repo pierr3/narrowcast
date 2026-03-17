@@ -162,6 +162,11 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			if len(payload) >= 1 {
 				log.Printf("[client %s] Hello v%d", remote, payload[0])
 			}
+			// Resend Welcome on every Hello (needed for relay: the initial
+			// Welcome may have been sent before any client was connected)
+			if err := conn.SendDatagram(welcome); err != nil {
+				log.Printf("[client %s] welcome resend: %v", remote, err)
+			}
 
 		case protocol.CmdSetFrequency:
 			if len(payload) < 8 {
