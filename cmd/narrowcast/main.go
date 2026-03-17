@@ -248,6 +248,7 @@ type dspChain struct {
 	voiceHPF    *dsp.HighPassIIR    // voice bandpass high-pass (AM only)
 	voiceLPF    *dsp.RealFIRFilter  // voice bandpass low-pass (AM only)
 	noiseGate   *dsp.NoiseGate      // soft noise gate (AM only)
+	agc         *dsp.AGC            // automatic gain control
 	opusEnc     *audio.OpusEncoder
 	audioRate   int
 }
@@ -334,6 +335,9 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		log.Printf("[dsp] AM voice cleanup: bandpass 300-3000 Hz + noise gate")
 	}
 
+	// Slow AGC: -12 dBFS target, max 30 dB gain, 20ms attack, 500ms release
+	agc := dsp.NewAGC(-12, 30, 20, 500, float64(audioRate))
+
 	opusEnc, err := audio.NewOpusEncoder(audioRate, opusBitrate)
 	if err != nil {
 		return nil, err
@@ -346,6 +350,7 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		audioDecimF: audioDecimF,
 		voiceHPF:    voiceHPF,
 		voiceLPF:    voiceLPF,
+		agc:         agc,
 		noiseGate:   noiseGate,
 		opusEnc:     opusEnc,
 		audioRate:   audioRate,
@@ -448,20 +453,15 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				chain.deemph.Process(audioSamples)
 			}
 
-			// AM voice cleanup: bandpass 300-3000 Hz + noise gate
+			// AM voice cleanup: bandpass 300-3000 Hz
 			if chain.voiceHPF != nil {
 				chain.voiceHPF.Process(audioSamples)
 			}
 			if chain.voiceLPF != nil {
 				audioSamples = chain.voiceLPF.Process(audioSamples)
 			}
-			if chain.noiseGate != nil {
-				// 10ms frames for RMS measurement
-				gateFrameSize := chain.audioRate * 10 / 1000
-				chain.noiseGate.Process(audioSamples, gateFrameSize)
-			}
 
-			// Measure signal power for S-meter (before normalization)
+			// Measure signal power for S-meter (before AGC)
 			var sumSq float64
 			for _, s := range audioSamples {
 				sumSq += s * s
@@ -498,21 +498,11 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				continue
 			}
 
-			// Normalize audio level
-			var maxAbs float64
-			for _, s := range audioSamples {
-				if a := math.Abs(s); a > maxAbs {
-					maxAbs = a
-				}
-			}
-			if maxAbs > 0.001 {
-				scale := 0.8 / maxAbs
-				if scale > 10 {
-					scale = 10 // limit AGC gain
-				}
-				for i := range audioSamples {
-					audioSamples[i] *= scale
-				}
+			// AGC: smooth gain control, then noise gate
+			chain.agc.Process(audioSamples)
+			if chain.noiseGate != nil {
+				gateFrameSize := chain.audioRate * 10 / 1000
+				chain.noiseGate.Process(audioSamples, gateFrameSize)
 			}
 
 			// Opus encode

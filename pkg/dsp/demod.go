@@ -174,6 +174,53 @@ func (f *HighPassIIR) Process(samples []float64) {
 	}
 }
 
+// AGC implements automatic gain control with separate attack/release smoothing.
+// Uses RMS-based level detection and logarithmic gain computation.
+type AGC struct {
+	targetLin    float64 // target output RMS (linear)
+	maxGain      float64 // maximum gain (linear)
+	attackCoeff  float64 // per-sample smoothing for increasing level (fast)
+	releaseCoeff float64 // per-sample smoothing for decreasing level (slow)
+	envLevel     float64 // smoothed envelope level
+}
+
+// NewAGC creates an automatic gain control.
+// targetDb is the desired output level in dBFS (e.g., -12).
+// maxGainDb is the maximum gain in dB (e.g., 30).
+// attackMs is how fast the AGC reacts to louder signals (e.g., 20ms).
+// releaseMs is how fast the AGC recovers from loud signals (e.g., 500ms).
+// sampleRate is the audio sample rate.
+func NewAGC(targetDb float64, maxGainDb float64, attackMs float64, releaseMs float64, sampleRate float64) *AGC {
+	return &AGC{
+		targetLin:    math.Pow(10, targetDb/20),
+		maxGain:      math.Pow(10, maxGainDb/20),
+		attackCoeff:  1.0 - math.Exp(-1.0/(attackMs*0.001*sampleRate)),
+		releaseCoeff: 1.0 - math.Exp(-1.0/(releaseMs*0.001*sampleRate)),
+		envLevel:     0.001,
+	}
+}
+
+// Process applies AGC in-place.
+func (a *AGC) Process(samples []float64) {
+	for i, s := range samples {
+		absS := math.Abs(s)
+		// Smooth envelope follower with asymmetric attack/release
+		if absS > a.envLevel {
+			a.envLevel += a.attackCoeff * (absS - a.envLevel)
+		} else {
+			a.envLevel += a.releaseCoeff * (absS - a.envLevel)
+		}
+		// Compute gain
+		if a.envLevel > 1e-10 {
+			gain := a.targetLin / a.envLevel
+			if gain > a.maxGain {
+				gain = a.maxGain
+			}
+			samples[i] = s * gain
+		}
+	}
+}
+
 // DeEmphasis applies a simple single-pole de-emphasis filter.
 // Used for NFM to restore the original audio frequency response.
 type DeEmphasis struct {
