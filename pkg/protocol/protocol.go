@@ -81,6 +81,10 @@ const (
 	// CmdAuthFail is sent by the relay on bad password.
 	// Payload: none.
 	CmdAuthFail byte = 0x34
+
+	// CmdUplink is sent by the Pi uplink to register as the upstream source.
+	// Payload: [32 bytes SHA-256 hash of upstream key]
+	CmdUplink byte = 0x35
 )
 
 const ProtoVersion = 1
