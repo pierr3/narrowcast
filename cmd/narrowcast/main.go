@@ -327,8 +327,10 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		lpfNumTaps := 65
 		lpfTaps := dsp.NewLowPassFIR(3000, float64(audioRate), lpfNumTaps)
 		voiceLPF = dsp.NewRealFIRDecimator(lpfTaps, 1) // decim=1, just filtering
-		// Soft noise gate: -40 dB threshold, 5ms attack, 150ms release
-		noiseGate = dsp.NewNoiseGate(-40, 5, 150, float64(audioRate))
+		// Soft noise gate: -45 dB threshold, 1ms attack, 600ms release
+		// Fast attack so voice comes through instantly.
+		// Slow release to hold through natural speech pauses (200-500ms).
+		noiseGate = dsp.NewNoiseGate(-45, 1, 600, float64(audioRate))
 		log.Printf("[dsp] AM voice cleanup: bandpass 300-3000 Hz + noise gate")
 	}
 
