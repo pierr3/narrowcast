@@ -244,7 +244,10 @@ type dspChain struct {
 	xlat        *dsp.XlatingFilter
 	demodFn     func([]complex128) []float64
 	deemph      *dsp.DeEmphasis
-	audioDecimF *dsp.RealFIRFilter // anti-aliased decimation filter (nil if no decimation needed)
+	audioDecimF *dsp.RealFIRFilter  // anti-aliased decimation filter (nil if no decimation needed)
+	voiceHPF    *dsp.HighPassIIR    // voice bandpass high-pass (AM only)
+	voiceLPF    *dsp.RealFIRFilter  // voice bandpass low-pass (AM only)
+	noiseGate   *dsp.NoiseGate      // soft noise gate (AM only)
 	opusEnc     *audio.OpusEncoder
 	audioRate   int
 }
@@ -313,6 +316,22 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		demodFn = amDemod.Demodulate
 	}
 
+	// AM voice cleanup: bandpass 300-3000 Hz + soft noise gate
+	var voiceHPF *dsp.HighPassIIR
+	var voiceLPF *dsp.RealFIRFilter
+	var noiseGate *dsp.NoiseGate
+	if mode == protocol.ModeAM {
+		// High-pass at 300 Hz to remove rumble and hum
+		voiceHPF = dsp.NewHighPassIIR(300, float64(audioRate))
+		// Low-pass at 3000 Hz to remove high-frequency noise
+		lpfNumTaps := 65
+		lpfTaps := dsp.NewLowPassFIR(3000, float64(audioRate), lpfNumTaps)
+		voiceLPF = dsp.NewRealFIRDecimator(lpfTaps, 1) // decim=1, just filtering
+		// Soft noise gate: -40 dB threshold, 5ms attack, 150ms release
+		noiseGate = dsp.NewNoiseGate(-40, 5, 150, float64(audioRate))
+		log.Printf("[dsp] AM voice cleanup: bandpass 300-3000 Hz + noise gate")
+	}
+
 	opusEnc, err := audio.NewOpusEncoder(audioRate, opusBitrate)
 	if err != nil {
 		return nil, err
@@ -323,6 +342,9 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		demodFn:     demodFn,
 		deemph:      deemph,
 		audioDecimF: audioDecimF,
+		voiceHPF:    voiceHPF,
+		voiceLPF:    voiceLPF,
+		noiseGate:   noiseGate,
 		opusEnc:     opusEnc,
 		audioRate:   audioRate,
 	}, nil
@@ -422,6 +444,19 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 			// De-emphasis for FM modes
 			if chain.deemph != nil {
 				chain.deemph.Process(audioSamples)
+			}
+
+			// AM voice cleanup: bandpass 300-3000 Hz + noise gate
+			if chain.voiceHPF != nil {
+				chain.voiceHPF.Process(audioSamples)
+			}
+			if chain.voiceLPF != nil {
+				audioSamples = chain.voiceLPF.Process(audioSamples)
+			}
+			if chain.noiseGate != nil {
+				// 10ms frames for RMS measurement
+				gateFrameSize := chain.audioRate * 10 / 1000
+				chain.noiseGate.Process(audioSamples, gateFrameSize)
 			}
 
 			// Measure signal power for S-meter (before normalization)
