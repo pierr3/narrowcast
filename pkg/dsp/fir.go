@@ -121,6 +121,49 @@ func (f *XlatingFilter) Process(input []complex128) []complex128 {
 	return output
 }
 
+// RealFIRFilter applies a real-valued FIR filter to audio samples with decimation.
+type RealFIRFilter struct {
+	taps    []float64
+	history []float64
+	pos     int
+	decim   int
+	count   int // counts input samples for decimation
+}
+
+// NewRealFIRDecimator creates a real-valued FIR low-pass filter with decimation.
+// taps are the filter coefficients, decim is the decimation factor.
+func NewRealFIRDecimator(taps []float64, decim int) *RealFIRFilter {
+	return &RealFIRFilter{
+		taps:    taps,
+		history: make([]float64, len(taps)),
+		decim:   decim,
+	}
+}
+
+// Process filters and decimates real-valued samples.
+func (f *RealFIRFilter) Process(input []float64) []float64 {
+	output := make([]float64, 0, len(input)/f.decim+1)
+	ntaps := len(f.taps)
+
+	for _, s := range input {
+		f.history[f.pos] = s
+		f.pos = (f.pos + 1) % ntaps
+		f.count++
+
+		if f.count >= f.decim {
+			f.count = 0
+			var acc float64
+			idx := f.pos
+			for j := 0; j < ntaps; j++ {
+				acc += f.history[idx] * f.taps[j]
+				idx = (idx + 1) % ntaps
+			}
+			output = append(output, acc)
+		}
+	}
+	return output
+}
+
 // CU8ToComplex converts interleaved unsigned 8-bit IQ samples to complex128.
 func CU8ToComplex(raw []byte) []complex128 {
 	n := len(raw) / 2

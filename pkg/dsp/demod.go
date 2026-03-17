@@ -34,16 +34,16 @@ func (d *FMDemodulator) Demodulate(input []complex128) []float64 {
 	return output
 }
 
-// AMDemodulator performs AM demodulation using envelope detection.
+// AMDemodulator performs AM demodulation using envelope detection
+// with a proper DC blocking filter.
 type AMDemodulator struct {
-	dcAlpha float64 // DC removal filter coefficient
-	dcState float64
+	dcBlock *DCBlocker
 }
 
 // NewAMDemodulator creates an AM envelope detector.
 func NewAMDemodulator() *AMDemodulator {
 	return &AMDemodulator{
-		dcAlpha: 0.995, // slow DC removal
+		dcBlock: NewDCBlocker(0.999),
 	}
 }
 
@@ -52,13 +52,36 @@ func NewAMDemodulator() *AMDemodulator {
 func (d *AMDemodulator) Demodulate(input []complex128) []float64 {
 	output := make([]float64, len(input))
 	for i, s := range input {
-		// Envelope = magnitude of complex sample
-		mag := cmplx.Abs(s)
-		// DC removal (high-pass filter)
-		d.dcState = d.dcAlpha*d.dcState + (1-d.dcAlpha)*mag
-		output[i] = mag - d.dcState
+		output[i] = cmplx.Abs(s)
 	}
+	d.dcBlock.Process(output)
 	return output
+}
+
+// DCBlocker is a single-pole high-pass IIR filter that removes DC offset.
+// Transfer function: y[n] = x[n] - x[n-1] + alpha * y[n-1]
+// alpha close to 1.0 gives a very low cutoff (~20 Hz at 16 kHz sample rate with 0.999).
+type DCBlocker struct {
+	alpha float64
+	xPrev float64
+	yPrev float64
+}
+
+// NewDCBlocker creates a DC blocking filter.
+// alpha controls the cutoff: closer to 1.0 = lower cutoff frequency.
+// For audio at 16 kHz, 0.999 gives ~2.5 Hz cutoff (removes DC without affecting audio).
+func NewDCBlocker(alpha float64) *DCBlocker {
+	return &DCBlocker{alpha: alpha}
+}
+
+// Process applies DC blocking in-place.
+func (d *DCBlocker) Process(samples []float64) {
+	for i, x := range samples {
+		y := x - d.xPrev + d.alpha*d.yPrev
+		d.xPrev = x
+		d.yPrev = y
+		samples[i] = y
+	}
 }
 
 // DeEmphasis applies a simple single-pole de-emphasis filter.

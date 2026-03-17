@@ -241,12 +241,12 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 
 // buildDSPChain constructs the DSP objects for a given demod mode.
 type dspChain struct {
-	xlat       *dsp.XlatingFilter
-	demodFn    func([]complex128) []float64
-	deemph     *dsp.DeEmphasis
-	audioDecim int
-	opusEnc    *audio.OpusEncoder
-	audioRate  int
+	xlat        *dsp.XlatingFilter
+	demodFn     func([]complex128) []float64
+	deemph      *dsp.DeEmphasis
+	audioDecimF *dsp.RealFIRFilter // anti-aliased decimation filter (nil if no decimation needed)
+	opusEnc     *audio.OpusEncoder
+	audioRate   int
 }
 
 func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*dspChain, error) {
@@ -281,6 +281,18 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 	lpfTaps := dsp.NewLowPassFIR(float64(channelBW)/2, float64(sampleRate), numTaps)
 	xlat := dsp.NewXlatingFilter(0, lpfTaps, xlatDecim, float64(sampleRate))
 
+	// Build anti-aliased audio decimation filter
+	var audioDecimF *dsp.RealFIRFilter
+	if audioDecim > 1 {
+		// Low-pass at audioRate/2 before decimation, operating at decimatedRate
+		aaNumTaps := audioDecim*10 + 1 // ~10 taps per decimation factor
+		if aaNumTaps > 127 {
+			aaNumTaps = 127
+		}
+		aaTaps := dsp.NewLowPassFIR(float64(audioRate)/2, decimatedRate, aaNumTaps)
+		audioDecimF = dsp.NewRealFIRDecimator(aaTaps, audioDecim)
+	}
+
 	log.Printf("[dsp] mode=%s xlatDecim=%d audioDecim=%d decimatedRate=%.0f audioRate=%d",
 		mode, xlatDecim, audioDecim, decimatedRate, audioRate)
 
@@ -307,12 +319,12 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 	}
 
 	return &dspChain{
-		xlat:       xlat,
-		demodFn:    demodFn,
-		deemph:     deemph,
-		audioDecim: audioDecim,
-		opusEnc:    opusEnc,
-		audioRate:  audioRate,
+		xlat:        xlat,
+		demodFn:     demodFn,
+		deemph:      deemph,
+		audioDecimF: audioDecimF,
+		opusEnc:     opusEnc,
+		audioRate:   audioRate,
 	}, nil
 }
 
@@ -402,13 +414,9 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 
 			audioSamples := chain.demodFn(channelIQ)
 
-			// Audio decimation to target rate
-			if chain.audioDecim > 1 {
-				decimated := make([]float64, 0, len(audioSamples)/chain.audioDecim)
-				for i := 0; i < len(audioSamples); i += chain.audioDecim {
-					decimated = append(decimated, audioSamples[i])
-				}
-				audioSamples = decimated
+			// Anti-aliased audio decimation to target rate
+			if chain.audioDecimF != nil {
+				audioSamples = chain.audioDecimF.Process(audioSamples)
 			}
 
 			// De-emphasis for FM modes
