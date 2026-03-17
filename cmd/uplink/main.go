@@ -96,17 +96,12 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 	}
 	log.Printf("[uplink] authenticated with relay")
 
-	// Send Hello to local server to initiate connection
+	// Send Hello to local server (establishes connection, but does NOT start streaming)
 	hello := []byte{protocol.CmdHello, protocol.ProtoVersion}
 	if err := localConn.SendDatagram(hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
 	}
-
-	// Start streaming from local server
-	if err := localConn.SendDatagram([]byte{protocol.CmdStart}); err != nil {
-		return fmt.Errorf("send start: %w", err)
-	}
-	log.Printf("[uplink] streaming started, bridging datagrams")
+	log.Printf("[uplink] bridging datagrams (SDR idle until client sends Start)")
 
 	// Bidirectional forwarding
 	var wg sync.WaitGroup

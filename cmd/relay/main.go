@@ -204,9 +204,17 @@ func (r *relay) handleClient(ctx context.Context, conn quic.Connection, dgram []
 	defer func() {
 		r.mu.Lock()
 		delete(r.clients, remote)
+		remaining := len(r.clients)
+		up := r.upstream
 		r.mu.Unlock()
 		conn.CloseWithError(0, "bye")
-		log.Printf("[relay] client disconnected: %s", remote)
+		log.Printf("[relay] client disconnected: %s (%d remaining)", remote, remaining)
+
+		// Stop SDR when last client disconnects
+		if remaining == 0 && up != nil {
+			_ = up.SendDatagram([]byte{protocol.CmdStop})
+			log.Printf("[relay] no clients remaining, sent Stop to upstream")
+		}
 	}()
 
 	// Read datagrams from client and forward to upstream
