@@ -146,30 +146,46 @@ func (ng *NoiseGate) Process(samples []float64, frameSize int) {
 	}
 }
 
-// HighPassIIR is a single-pole high-pass filter for removing low-frequency rumble.
-// Uses the same topology as DCBlocker but with a configurable cutoff.
+// HighPassIIR is a 2nd-order (biquad) high-pass filter for removing
+// low-frequency hum and carrier residuals. -12 dB/octave rolloff.
 type HighPassIIR struct {
-	alpha float64
-	xPrev float64
-	yPrev float64
+	b0, b1, b2 float64 // feedforward coefficients
+	a1, a2     float64 // feedback coefficients
+	x1, x2     float64 // input history
+	y1, y2     float64 // output history
 }
 
-// NewHighPassIIR creates a single-pole high-pass filter.
+// NewHighPassIIR creates a 2nd-order Butterworth high-pass filter.
 // cutoffHz is the -3dB cutoff frequency.
 // sampleRate is the audio sample rate.
 func NewHighPassIIR(cutoffHz float64, sampleRate float64) *HighPassIIR {
-	rc := 1.0 / (2.0 * math.Pi * cutoffHz)
-	dt := 1.0 / sampleRate
-	alpha := rc / (rc + dt)
-	return &HighPassIIR{alpha: alpha}
+	// Bilinear transform of 2nd-order Butterworth high-pass
+	w0 := 2.0 * math.Pi * cutoffHz / sampleRate
+	cosW0 := math.Cos(w0)
+	sinW0 := math.Sin(w0)
+	alpha := sinW0 / math.Sqrt2 // Q = 0.707 (Butterworth)
+
+	b0 := (1 + cosW0) / 2
+	b1 := -(1 + cosW0)
+	b2 := (1 + cosW0) / 2
+	a0 := 1 + alpha
+	a1 := -2 * cosW0
+	a2 := 1 - alpha
+
+	return &HighPassIIR{
+		b0: b0 / a0, b1: b1 / a0, b2: b2 / a0,
+		a1: a1 / a0, a2: a2 / a0,
+	}
 }
 
 // Process applies high-pass filtering in-place.
 func (f *HighPassIIR) Process(samples []float64) {
 	for i, x := range samples {
-		y := f.alpha * (f.yPrev + x - f.xPrev)
-		f.xPrev = x
-		f.yPrev = y
+		y := f.b0*x + f.b1*f.x1 + f.b2*f.x2 - f.a1*f.y1 - f.a2*f.y2
+		f.x2 = f.x1
+		f.x1 = x
+		f.y2 = f.y1
+		f.y1 = y
 		samples[i] = y
 	}
 }

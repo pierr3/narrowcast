@@ -323,8 +323,8 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 	var voiceLPF *dsp.RealFIRFilter
 	var noiseGate *dsp.NoiseGate
 	if mode == protocol.ModeAM {
-		// High-pass at 300 Hz to remove rumble and hum
-		voiceHPF = dsp.NewHighPassIIR(300, float64(audioRate))
+		// 2nd-order high-pass at 400 Hz to kill carrier hum and rumble
+		voiceHPF = dsp.NewHighPassIIR(400, float64(audioRate))
 		// Low-pass at 3000 Hz to remove high-frequency noise
 		lpfNumTaps := 65
 		lpfTaps := dsp.NewLowPassFIR(3000, float64(audioRate), lpfNumTaps)
