@@ -50,24 +50,27 @@ func main() {
 }
 
 func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"narrowcast-v1"},
-	}
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
 	}
 
-	// Connect to local narrowcast server
-	localConn, err := quic.DialAddr(ctx, localAddr, tlsConf, quicConf)
+	// Local connection: self-signed Pi cert, skip verification
+	localTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"narrowcast-v1"},
+	}
+	localConn, err := quic.DialAddr(ctx, localAddr, localTLS, quicConf)
 	if err != nil {
 		return fmt.Errorf("local connect: %w", err)
 	}
 	defer localConn.CloseWithError(0, "uplink-done")
 	log.Printf("[uplink] connected to local narrowcast at %s", localAddr)
 
-	// Connect to remote relay
-	relayConn, err := quic.DialAddr(ctx, relayAddr, tlsConf, quicConf)
+	// Relay connection: verify TLS cert (Let's Encrypt or trusted CA)
+	relayTLS := &tls.Config{
+		NextProtos: []string{"narrowcast-v1"},
+	}
+	relayConn, err := quic.DialAddr(ctx, relayAddr, relayTLS, quicConf)
 	if err != nil {
 		return fmt.Errorf("relay connect: %w", err)
 	}
