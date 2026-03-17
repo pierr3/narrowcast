@@ -47,7 +47,7 @@ func DefaultConfig() *Config {
 		DemodMode:     protocol.ModeNFM,
 		SquelchDBm:    -80,
 		FFTSize:       1024,
-		FFTRate:       10,
+		FFTRate:       20,
 		OpusBitrate:   32000,
 	}
 }
