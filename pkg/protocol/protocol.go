@@ -119,7 +119,7 @@ func (m DemodMode) ChannelBandwidth() int {
 	case ModeWFM:
 		return 200_000
 	case ModeAM:
-		return 16_000
+		return 25_000
 	default:
 		return 16_000
 	}
