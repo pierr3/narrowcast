@@ -51,9 +51,10 @@ type relay struct {
 	uplinkHash [32]byte
 	clientHash [32]byte
 
-	mu       sync.RWMutex
-	upstream quic.Connection            // the Pi uplink connection
-	clients  map[string]quic.Connection // connected clients
+	mu         sync.RWMutex
+	upstream   quic.Connection            // the Pi uplink connection
+	clients    map[string]quic.Connection // connected clients
+	controller string                     // remote addr of the controlling client
 }
 
 func (r *relay) run(ctx context.Context, listenAddr, certFile, keyFile string) error {
@@ -194,19 +195,40 @@ func (r *relay) handleClient(ctx context.Context, conn quic.Connection, dgram []
 
 	_ = conn.SendDatagram([]byte{protocol.CmdAuthOK})
 
-	// Register client
+	// Register client and assign controller if none exists
 	r.mu.Lock()
 	r.clients[remote] = conn
+	isController := r.controller == ""
+	if isController {
+		r.controller = remote
+	}
 	r.mu.Unlock()
 
-	log.Printf("[relay] client authenticated: %s (%d clients)", remote, len(r.clients))
+	if isController {
+		log.Printf("[relay] client authenticated: %s (%d clients) [controller]", remote, len(r.clients))
+	} else {
+		log.Printf("[relay] client authenticated: %s (%d clients) [listener]", remote, len(r.clients))
+	}
 
 	defer func() {
 		r.mu.Lock()
 		delete(r.clients, remote)
 		remaining := len(r.clients)
 		up := r.upstream
+
+		// If the controller disconnected, promote another client
+		if r.controller == remote {
+			r.controller = ""
+			for addr := range r.clients {
+				r.controller = addr
+				break
+			}
+			if r.controller != "" {
+				log.Printf("[relay] controller promoted: %s", r.controller)
+			}
+		}
 		r.mu.Unlock()
+
 		conn.CloseWithError(0, "bye")
 		log.Printf("[relay] client disconnected: %s (%d remaining)", remote, remaining)
 
@@ -217,16 +239,19 @@ func (r *relay) handleClient(ctx context.Context, conn quic.Connection, dgram []
 		}
 	}()
 
-	// Read datagrams from client and forward to upstream
+	// Read datagrams from client — only forward commands from the controller
 	for {
 		dg, err := conn.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}
+
 		r.mu.RLock()
 		up := r.upstream
+		isCtrl := r.controller == remote
 		r.mu.RUnlock()
-		if up != nil {
+
+		if up != nil && isCtrl {
 			_ = up.SendDatagram(dg)
 		}
 	}
