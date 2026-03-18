@@ -1,0 +1,19 @@
+[Unit]
+Description=Narrowcast SDR server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/narrowcast \
+    -cert /etc/narrowcast/certs/server.crt \
+    -key /etc/narrowcast/certs/server.key
+WorkingDirectory=/etc/narrowcast
+Restart=always
+RestartSec=3
+User=narrowcast
+Group=narrowcast
+# Allow access to USB SDR devices
+SupplementaryGroups=plugdev
+
+[Install]
+WantedBy=multi-user.target

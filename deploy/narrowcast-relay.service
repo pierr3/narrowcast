@@ -1,0 +1,22 @@
+[Unit]
+Description=Narrowcast relay server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/narrowcast-relay/relay.env
+ExecStart=/usr/local/bin/narrowcast-relay \
+    -listen 0.0.0.0:4444 \
+    -cert /etc/narrowcast-relay/certs/server.crt \
+    -key /etc/narrowcast-relay/certs/server.key \
+    -uplink-key ${UPLINK_KEY} \
+    -password ${CLIENT_PASSWORD}
+WorkingDirectory=/etc/narrowcast-relay
+Restart=always
+RestartSec=3
+User=narrowcast
+Group=narrowcast
+
+[Install]
+WantedBy=multi-user.target

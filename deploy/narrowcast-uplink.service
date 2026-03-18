@@ -1,0 +1,20 @@
+[Unit]
+Description=Narrowcast uplink to relay
+After=network-online.target narrowcast.service
+Wants=network-online.target
+Requires=narrowcast.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/narrowcast/uplink.env
+ExecStart=/usr/local/bin/narrowcast-uplink \
+    -local localhost:4444 \
+    -relay ${RELAY_ADDR} \
+    -key ${UPLINK_KEY}
+Restart=always
+RestartSec=5
+User=narrowcast
+Group=narrowcast
+
+[Install]
+WantedBy=multi-user.target
