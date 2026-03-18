@@ -252,7 +252,6 @@ type dspChain struct {
 	audioDecimF *dsp.RealFIRFilter  // anti-aliased decimation filter (nil if no decimation needed)
 	voiceHPF    *dsp.HighPassIIR    // voice bandpass high-pass (AM only)
 	voiceLPF    *dsp.RealFIRFilter  // voice bandpass low-pass (AM only)
-	noiseGate   *dsp.NoiseGate      // soft noise gate (AM only)
 	limiter     *dsp.SoftLimiter     // soft clipper for ADC saturation
 	agc         *dsp.AGC            // automatic gain control
 	opusEnc     *audio.OpusEncoder
@@ -323,10 +322,11 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		demodFn = amDemod.Demodulate
 	}
 
-	// AM voice cleanup: bandpass 300-3000 Hz + soft noise gate
+	// AM voice cleanup: bandpass 400-3000 Hz
+	// No noise gate for AM — squelch handles muting between transmissions,
+	// and the gate causes crackle by chattering on AGC-amplified noise.
 	var voiceHPF *dsp.HighPassIIR
 	var voiceLPF *dsp.RealFIRFilter
-	var noiseGate *dsp.NoiseGate
 	if mode == protocol.ModeAM {
 		// 2nd-order high-pass at 400 Hz to kill carrier hum and rumble
 		voiceHPF = dsp.NewHighPassIIR(400, float64(audioRate))
@@ -334,11 +334,7 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		lpfNumTaps := 65
 		lpfTaps := dsp.NewLowPassFIR(3000, float64(audioRate), lpfNumTaps)
 		voiceLPF = dsp.NewRealFIRDecimator(lpfTaps, 1) // decim=1, just filtering
-		// Soft noise gate: -45 dB threshold, 1ms attack, 600ms release
-		// Fast attack so voice comes through instantly.
-		// Slow release to hold through natural speech pauses (200-500ms).
-		noiseGate = dsp.NewNoiseGate(-45, 1, 600, float64(audioRate))
-		log.Printf("[dsp] AM voice cleanup: bandpass 300-3000 Hz + noise gate")
+		log.Printf("[dsp] AM voice cleanup: bandpass 400-3000 Hz")
 	}
 
 	// Soft limiter to tame ADC-saturated signals (drive=2.0 = moderate compression)
@@ -348,8 +344,16 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		limiter = dsp.NewSoftLimiter(2.0)
 	}
 
-	// Slow AGC: -12 dBFS target, max 30 dB gain, 20ms attack, 500ms release
-	agc := dsp.NewAGC(-12, 30, 20, 500, float64(audioRate))
+	// AGC: -12 dBFS target, max 30 dB gain.
+	// AM uses slower attack (50ms) to avoid pumping on speech dynamics.
+	// FM uses faster attack (20ms) since amplitude doesn't carry information.
+	agcAttack := 20.0
+	agcRelease := 500.0
+	if mode == protocol.ModeAM {
+		agcAttack = 50.0
+		agcRelease = 1000.0
+	}
+	agc := dsp.NewAGC(-12, 30, agcAttack, agcRelease, float64(audioRate))
 
 	opusEnc, err := audio.NewOpusEncoder(audioRate, opusBitrate)
 	if err != nil {
@@ -365,7 +369,6 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		voiceLPF:    voiceLPF,
 		limiter:     limiter,
 		agc:         agc,
-		noiseGate:   noiseGate,
 		opusEnc:     opusEnc,
 		audioRate:   audioRate,
 	}, nil
@@ -517,12 +520,8 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				continue
 			}
 
-			// AGC: smooth gain control, then noise gate
+			// AGC: smooth gain control
 			chain.agc.Process(audioSamples)
-			if chain.noiseGate != nil {
-				gateFrameSize := chain.audioRate * 10 / 1000
-				chain.noiseGate.Process(audioSamples, gateFrameSize)
-			}
 
 			// Opus encode
 			packets, err := chain.opusEnc.Encode(audioSamples)
