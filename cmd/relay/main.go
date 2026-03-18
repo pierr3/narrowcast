@@ -235,7 +235,20 @@ func (r *relay) handleClient(ctx context.Context, conn quic.Connection, dgram []
 func (r *relay) fanOutToClients(dg []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	// Append client count to status datagrams so clients can display it
+	out := dg
+	if len(dg) > 0 && dg[0] == protocol.DatagramStatus {
+		out = make([]byte, len(dg)+1)
+		copy(out, dg)
+		count := len(r.clients)
+		if count > 255 {
+			count = 255
+		}
+		out[len(dg)] = byte(count)
+	}
+
 	for _, c := range r.clients {
-		_ = c.SendDatagram(dg)
+		_ = c.SendDatagram(out)
 	}
 }

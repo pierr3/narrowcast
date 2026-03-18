@@ -498,17 +498,20 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 			}
 
 			// Send status datagram periodically
+			// Payload: [float32 smeter][float32 squelch][uint8 mode][uint64 freqHz]
 			if time.Since(lastStatus) >= statusInterval {
 				lastStatus = time.Now()
 				state.mu.RLock()
 				sq := state.squelchDb
 				m := state.mode
+				freq := state.freqHz
 				state.mu.RUnlock()
-				statusDgram := make([]byte, 10)
+				statusDgram := make([]byte, 18)
 				statusDgram[0] = protocol.DatagramStatus
 				copy(statusDgram[1:5], protocol.EncodeFloat32(signalPowerDb))
 				copy(statusDgram[5:9], protocol.EncodeFloat32(sq))
 				statusDgram[9] = byte(m)
+				copy(statusDgram[10:18], protocol.EncodeUint64(freq))
 				_ = conn.SendDatagram(statusDgram)
 			}
 

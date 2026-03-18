@@ -31,7 +31,7 @@ const (
 	DatagramFFT byte = 0x02
 
 	// DatagramStatus carries periodic telemetry.
-	// Payload: [float32 smeter_dbm][float32 squelch_dbm][uint8 demod_mode]
+	// Payload: [float32 smeter_dbm][float32 squelch_dbm][uint8 demod_mode][uint64 freq_hz]
 	DatagramStatus byte = 0x03
 )
 
