@@ -342,7 +342,11 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 	}
 
 	// Soft limiter to tame ADC-saturated signals (drive=2.0 = moderate compression)
-	limiter := dsp.NewSoftLimiter(2.0)
+	// Skip for AM — amplitude IS the audio, so tanh compression distorts the voice.
+	var limiter *dsp.SoftLimiter
+	if mode != protocol.ModeAM {
+		limiter = dsp.NewSoftLimiter(2.0)
+	}
 
 	// Slow AGC: -12 dBFS target, max 30 dB gain, 20ms attack, 500ms release
 	agc := dsp.NewAGC(-12, 30, 20, 500, float64(audioRate))
@@ -453,8 +457,10 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 
 			audioSamples := chain.demodFn(channelIQ)
 
-			// Soft limit to compress ADC-saturated signals
-			chain.limiter.Process(audioSamples)
+			// Soft limit to compress ADC-saturated signals (FM only)
+			if chain.limiter != nil {
+				chain.limiter.Process(audioSamples)
+			}
 
 			// Anti-aliased audio decimation to target rate
 			if chain.audioDecimF != nil {
