@@ -43,10 +43,51 @@ ENVEOF
     fi
 
     echo ""
-    echo "TLS certs: place your cert and key at:"
-    echo "  /etc/narrowcast-relay/certs/server.crt"
-    echo "  /etc/narrowcast-relay/certs/server.key"
-    echo "(e.g. from Let's Encrypt)"
+    echo "TLS cert setup."
+    echo "If you have a Let's Encrypt cert for the relay's domain, this script"
+    echo "can copy it into /etc/narrowcast-relay/certs/ and install a renewal"
+    echo "hook so cert rotation happens automatically. Leave blank to skip and"
+    echo "manage certs yourself."
+    read -rp "Let's Encrypt domain (blank to skip): " le_domain
+
+    if [ -n "$le_domain" ]; then
+        if [ ! -d "/etc/letsencrypt/live/$le_domain" ]; then
+            echo "==> WARNING: /etc/letsencrypt/live/$le_domain does not exist."
+            echo "    Skipping cert copy. Run certbot first, then rerun this script."
+        else
+            echo "==> Copying cert + key into /etc/narrowcast-relay/certs/..."
+            sudo cp "/etc/letsencrypt/live/$le_domain/fullchain.pem" /etc/narrowcast-relay/certs/server.crt
+            sudo cp "/etc/letsencrypt/live/$le_domain/privkey.pem"  /etc/narrowcast-relay/certs/server.key
+            sudo chown narrowcast:narrowcast /etc/narrowcast-relay/certs/server.*
+            sudo chmod 644 /etc/narrowcast-relay/certs/server.crt
+            sudo chmod 600 /etc/narrowcast-relay/certs/server.key
+
+            echo "==> Installing /etc/letsencrypt/renewal-hooks/post/narrowcast-relay.sh"
+            sudo mkdir -p /etc/letsencrypt/renewal-hooks/post
+            sudo tee /etc/letsencrypt/renewal-hooks/post/narrowcast-relay.sh > /dev/null <<HOOKEOF
+#!/bin/bash
+# Auto-installed by narrowcast install.sh.
+# Copies the renewed Let's Encrypt cert into the location the relay reads
+# (the narrowcast user can't traverse /etc/letsencrypt/live), then bounces
+# the relay so it picks up the new cert.
+set -e
+DOMAIN="$le_domain"
+cp "/etc/letsencrypt/live/\$DOMAIN/fullchain.pem" /etc/narrowcast-relay/certs/server.crt
+cp "/etc/letsencrypt/live/\$DOMAIN/privkey.pem"  /etc/narrowcast-relay/certs/server.key
+chown narrowcast:narrowcast /etc/narrowcast-relay/certs/server.*
+chmod 644 /etc/narrowcast-relay/certs/server.crt
+chmod 600 /etc/narrowcast-relay/certs/server.key
+systemctl restart narrowcast-relay
+HOOKEOF
+            sudo chmod +x /etc/letsencrypt/renewal-hooks/post/narrowcast-relay.sh
+            echo "==> Cert in place + renewal hook installed."
+        fi
+    else
+        echo ""
+        echo "Skipped LE setup. Place certs manually at:"
+        echo "  /etc/narrowcast-relay/certs/server.crt"
+        echo "  /etc/narrowcast-relay/certs/server.key"
+    fi
 
     echo "==> Installing systemd service..."
     sudo cp deploy/narrowcast-relay.service /etc/systemd/system/
