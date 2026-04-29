@@ -1,76 +1,144 @@
 # Narrowcast — Lightweight RTL-SDR Streaming Server
 
-A Go server that runs on a Raspberry Pi, demodulates RTL-SDR signals, and streams compressed audio + waterfall data to clients over QUIC.
+A Go server that runs on a Raspberry Pi, demodulates RTL-SDR signals server-side, and streams compressed audio + waterfall data over QUIC to clients on the worst networks they can find.
 
-## Why
+## Goal
 
-SpyServer is closed-source. SDR++ server streams raw IQ (high bandwidth). Narrowcast does server-side demodulation and sends only:
+Build the smallest, most resilient SDR server for **remote stations on bad networks**: a Pi at a relative's house, a beach cabin on LTE, a mountain repeater on 4G, a boat on satellite. The constraint is the uplink, not the radio.
 
-- **Opus audio** (~4 KB/s) — NFM, WFM, AM
-- **FFT waterfall** (~3-5 KB/s) — 1024 u8 bins at 10 fps
-- **Total: ~10 KB/s** — works on bad WiFi, cellular, anything
+Design priorities, in order:
 
-Everything is encrypted via QUIC (TLS 1.3). No VPN needed.
+1. **Bandwidth-cheap**: total stream ~14 KB/s (~110 kbps). Works on 3G, EDGE-with-headroom, congested wifi, satellite.
+2. **Loss-tolerant**: graceful behavior under packet loss and jitter — single dropped audio packets are reconstructed, not silenced.
+3. **Modern transport**: QUIC + TLS 1.3 + datagrams. Single UDP port. Connection migration for handoffs between cell towers / wifi.
+4. **Low footprint**: ~2.5K LOC, ~1 CPU core on a Pi 5, ~10 MB RAM. No heavy dependencies.
+5. **Basic features**: NFM, WFM, AM, S-meter, waterfall, live tuning. The 80% of what a listener actually does.
+
+## Why not the existing tools
+
+- **SpyServer**: closed-source, runs over TCP, no datagram support, no FEC, head-of-line blocking when a packet is late.
+- **SDR++ server**: streams raw IQ — multi-megabit per client, dead on a mobile uplink.
+- **OpenWebRX**: web-only, heavy server, no encrypted-by-default transport.
+
+Narrowcast does server-side demodulation and sends only the finished audio + a downsampled waterfall, all encrypted, all over QUIC datagrams.
+
+## Bandwidth budget
+
+| Stream    | Size      | Notes                                          |
+| --------- | --------- | ---------------------------------------------- |
+| Opus audio| ~4 KB/s   | 32 kbps mono + in-band FEC for ~10% loss       |
+| FFT       | ~10 KB/s  | 1024 u8 bins × 10 fps                          |
+| Status    | ~70 B/s   | S-meter, mode, freq, squelch, client count     |
+| **Total** | **~14 KB/s** | **~110 kbps — fits 3G / weak LTE / sat**       |
+
+Reference: SpyServer ~200 KB/s. SDR++ raw IQ: 4–10 Mbps. Narrowcast is 15–500× lighter.
 
 ## Architecture
 
 ```txt
-RTL-SDR → librtlsdr → [FIR xlating filter] → [FM/AM demod] → [Opus encode] → QUIC datagrams
-                     → [FFT 1024pt]         → [u8 magnitude bins]            → QUIC datagrams
-                                              [commands]                      ← QUIC stream 0
+                    ┌── Pi (cellular / wifi) ─────────────────────┐
+                    │  RTL-SDR ──► librtlsdr                      │
+                    │       ──► xlating FIR + decimate            │
+                    │       ──► FM/AM demod                       │
+                    │       ──► AGC (hang-time on AM)             │
+                    │       ──► Opus + FEC ──► QUIC datagrams ────┼──┐
+                    │       ──► FFT 1024pt  ──► QUIC datagrams ───┼──┤
+                    │           commands     ◄── QUIC datagrams ──┼──┤
+                    └─────────────────────────────────────────────┘  │
+                                                                     │
+                              QUIC over UDP, TLS 1.3, single port    │
+                                                                     │
+                                                                     ▼
+                                              ┌──── relay (VPS) ─────────┐
+                                              │ auth, fan-out, multiplex │
+                                              └──────────────────────────┘
+                                                          │
+                                                          ▼
+                                                ┌──── clients ─────┐
+                                                │  any platform    │
+                                                └──────────────────┘
 ```
 
-## Requirements
+A typical deployment: `narrowcast` (server-side demod) on the Pi at the antenna, `narrowcast-uplink` bridging to a `narrowcast-relay` on a VPS with a real DNS name, clients connecting to the relay over QUIC. The Pi only needs a single outbound UDP connection — no port forwarding, no public IP.
 
-- Go 1.23+
-- librtlsdr (`apt install librtlsdr-dev` on Pi, `brew install librtlsdr` on macOS)
-- libopus (`apt install libopus-dev` on Pi, `brew install opus` on macOS)
-- RTL-SDR USB dongle
+## Resilience
 
-## Quick Start
+The design assumes the network is bad and tries to fail gracefully:
+
+- **QUIC datagrams** for audio/FFT/status — a dropped packet does not head-of-line-block the next one (the dominant SpyServer-over-TCP failure mode).
+- **Opus in-band FEC**: each frame carries a low-bitrate copy of the previous frame. A single dropped audio packet is reconstructed, not silenced. Costs ~25% bitrate, recovers transparent under loss up to ~10%.
+- **Flush-on-retune**: changing frequency drains stale IQ and resets every DSP stage so the listener hears a clean cut, not a transient sweep.
+- **Reset-on-drop**: when the SDR pipeline can't keep up (slow client, congested network), DSP state is cleared at the boundary instead of filtering across a discontinuity. Brief silence beats sustained warbling artifacts.
+- **Hang-time AGC for AM**: gain freezes during dead air, so the first syllable of an aviation transmission isn't clipped while attack catches up.
+- **Reconnect-with-backoff** on the uplink and clients.
+
+## Demodulation modes
+
+| Mode | Channel BW | Audio Rate | Use case                  |
+| ---- | ---------- | ---------- | ------------------------- |
+| NFM  | 16 kHz     | 16 kHz     | Amateur, PMR, marine VHF  |
+| WFM  | 200 kHz    | 48 kHz     | Broadcast FM              |
+| AM   | 25 kHz     | 16 kHz     | Aviation band (full ICAO) |
+
+## Quick start
 
 ```bash
-# Generate TLS certs
+# macOS deps
+brew install librtlsdr opus opusfile pkg-config
+
+# Pi deps
+sudo apt install librtlsdr-dev libopus-dev libopusfile-dev
+
+# Generate self-signed TLS certs
 make certs
 
-# Build and run
+# Build + run
 make run
 ```
 
-## Cross-compile for Raspberry Pi
+## Cross-compile for Pi from macOS
 
 ```bash
-# Requires cross-compiler toolchain
-make build-pi
-
-# Copy to Pi
+make build-pi           # produces bin/narrowcast-arm64
 scp bin/narrowcast-arm64 pi@<pi-ip>:~/narrowcast
 scp -r certs/ pi@<pi-ip>:~/certs/
 ```
 
+## Update a running deployment
+
+```bash
+ssh pi
+cd ~/narrowcast
+./update.sh             # auto-detects SDR vs relay role
+```
+
+The script stops the relevant systemd unit, rebuilds, installs, restarts. ~30 sec downtime for the SDR side, ~5 sec for the relay.
+
+Rule of thumb: **only redeploy the relay when a commit touches `cmd/relay`, `pkg/protocol`, or shared types**. Pure DSP / SDR-side commits are Pi-only.
+
 ## Protocol
 
-QUIC connection on UDP port 4444 (default).
+QUIC over UDP, TLS 1.3, single port (default 4444). Datagrams for everything — commands, audio, telemetry. No reliable streams.
 
-| Channel  | Transport                  | Content                           |
-| -------- | -------------------------- | --------------------------------- |
-| Commands | QUIC stream (reliable)     | Length-prefixed binary messages   |
-| Audio    | QUIC datagram (unreliable) | `0x01` + Opus packet              |
-| FFT      | QUIC datagram (unreliable) | `0x02` + u16 bin count + u8 bins  |
-| Status   | QUIC datagram (unreliable) | `0x03` + s-meter + squelch + mode |
-
-## Demodulation Modes
-
-| Mode | Bandwidth | Audio Rate | Use Case             |
-| ---- | --------- | ---------- | -------------------- |
-| NFM  | 12.5 kHz  | 16 kHz     | Amateur, PMR, marine |
-| WFM  | 200 kHz   | 48 kHz     | Broadcast FM         |
-| AM   | 10 kHz    | 16 kHz     | Aviation band        |
+| Datagram type | Direction      | Payload                                           |
+| ------------- | -------------- | ------------------------------------------------- |
+| `0x01` audio  | server→client  | Opus packet                                       |
+| `0x02` FFT    | server→client  | `[u16 numBins][u8 bins...]`                       |
+| `0x03` status | server→client  | `[f32 smeter][f32 squelch][u8 mode][u64 freq]…`   |
+| `0x10` setfreq| client→server  | `[u64 freqHz]`                                    |
+| `0x11` setmode| client→server  | `[u8 mode]`                                       |
+| `0x12` squelch| client→server  | `[f32 dBm]`                                       |
+| `0x13` setgain| client→server  | `[f32 dB]` (0 = auto)                             |
+| `0x20` start  | client→server  | (none)                                            |
+| `0x21` stop   | client→server  | (none)                                            |
+| `0x30` hello  | client→server  | `[u8 protoVer]`                                   |
+| `0x31` welcome| server→client  | `[u8 ver][u64 minHz][u64 maxHz][f32 sampleRate]`  |
+| `0x32`/`0x33`/`0x34` | client/relay | password / uplink-key auth (SHA-256)         |
 
 ## Configuration
 
 ```txt
-Usage: narrowcast [flags]
+narrowcast [flags]
   --host          Listen address (default: 0.0.0.0)
   --port          Listen port (default: 4444)
   --cert          TLS cert file (default: certs/server.crt)
@@ -82,15 +150,26 @@ Usage: narrowcast [flags]
   --opus-bitrate  Opus bitrate in bps (default: 32000)
 ```
 
-## Pi Setup
+## Pi setup notes
 
 ```bash
-# Install deps
-sudo apt install librtlsdr-dev libopus-dev
+# Install C deps
+sudo apt install librtlsdr-dev libopus-dev libopusfile-dev
 
-# Increase UDP buffer (add to /etc/sysctl.conf)
+# Increase UDP buffer (add to /etc/sysctl.conf for persistence)
 sudo sysctl -w net.core.rmem_max=7500000
 
 # Run
 ./narrowcast --host 0.0.0.0 --port 4444
 ```
+
+## Status
+
+Working: NFM/WFM/AM, S-meter, waterfall, live tuning, multi-client via relay (last-writer-wins on tuning), Opus FEC, hang-time AM AGC, flush + reset on glitches.
+
+On the roadmap, in priority order:
+
+1. **FFT auto-throttle on client congestion** — drop FFT rate when QUIC stats show RTT or loss spiking. Keeps audio prioritized when bandwidth gets tight.
+2. **Connection-quality status field** — surface RTT / loss to the client UI so users see "weak signal" instead of silence.
+3. **Per-client virtual VFO** — each client tunes independently within the hardware's capture window via per-client NCO. Multiple listeners on the same Pi without contention.
+4. **SSB (USB/LSB)** — for HF amateur with an upconverter.
