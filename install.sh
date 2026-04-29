@@ -123,18 +123,28 @@ HOOKEOF
             -days 3650 -nodes -subj "/CN=narrowcast"
         sudo chown narrowcast:narrowcast /etc/narrowcast/certs/*
         sudo chmod 600 /etc/narrowcast/certs/server.key
+        echo "==> Self-signed cert created (uplink connects via InsecureSkipVerify)."
+    else
+        echo "==> /etc/narrowcast/certs/server.crt already exists — leaving untouched."
     fi
 
     if [ ! -f /etc/narrowcast/uplink.env ]; then
         echo ""
-        read -rp "Relay address (host:port): " relay_addr
-        read -rp "Uplink key: " uplink_key
+        echo "Uplink connects to the relay over the public network."
+        echo "Relay address is host:port — port should match the relay's listen port"
+        echo "(443 by default since the recent change)."
+        read -rp "Relay address (e.g. relay.example.com:443): " relay_addr
+        read -rp "Uplink key (must match the relay's UPLINK_KEY): " uplink_key
         sudo tee /etc/narrowcast/uplink.env > /dev/null <<ENVEOF
 RELAY_ADDR=${relay_addr}
 UPLINK_KEY=${uplink_key}
 ENVEOF
         sudo chown narrowcast:narrowcast /etc/narrowcast/uplink.env
         sudo chmod 600 /etc/narrowcast/uplink.env
+        echo "==> Created /etc/narrowcast/uplink.env"
+    else
+        echo "==> /etc/narrowcast/uplink.env already exists — leaving untouched."
+        echo "    To change relay address or key, edit it directly or delete and rerun."
     fi
 
     echo "==> Installing systemd services..."
@@ -143,14 +153,19 @@ ENVEOF
     sudo systemctl daemon-reload
     sudo systemctl enable narrowcast narrowcast-uplink
 
-    echo "==> Starting services..."
-    sudo systemctl start narrowcast
-    sudo systemctl start narrowcast-uplink
+    echo "==> (Re)starting services..."
+    # Restart, not just start — covers the rerun case where binaries changed
+    # but services were already up. Plain start is a no-op when already active.
+    sudo systemctl restart narrowcast
+    sudo systemctl restart narrowcast-uplink
 
     echo ""
     echo "Done. Check status with:"
     echo "  sudo systemctl status narrowcast"
     echo "  sudo systemctl status narrowcast-uplink"
+    echo ""
+    echo "Tail logs with:"
+    echo "  sudo journalctl -u narrowcast -u narrowcast-uplink -f"
     ;;
 *)
     echo "Invalid choice." >&2
