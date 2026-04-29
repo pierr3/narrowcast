@@ -106,18 +106,6 @@ public actor QUICTransport {
             }
             group.start(queue: .global(qos: .userInitiated))
         }
-
-        // After the group is ready, extract an NWConnection from it. The
-        // working datagram example does this even though it never sends on
-        // the resulting stream — apparently QUIC's state machine on the
-        // Apple side wants a connection object alive for traffic to flow.
-        if let conn = NWConnection(from: group) {
-            conn.stateUpdateHandler = { state in
-                NSLog("[narrowcast] stream state: \(state)")
-            }
-            conn.start(queue: .global(qos: .userInitiated))
-            self.streamConnection = conn
-        }
     }
 
     public func send(_ datagram: Data) async throws {
