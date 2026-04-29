@@ -6,9 +6,10 @@ import NarrowcastProtocol
 // datagrams into typed Events, and exposes helpers for the commands the
 // UI cares about (set freq, set mode, etc).
 //
-// Lifecycle: build with the server config, await `connect()` (which performs
-// auth if a password is set, then sends Hello and waits for Welcome), then
-// consume `events` and call command methods. Call `close()` when done.
+// Internally a single pump consumes transport.inbound — AsyncStream is
+// iterable only once, so auth/welcome handshakes are completed by routing
+// matched messages to one-shot continuations and forwarding the rest to
+// the public events stream.
 public actor NarrowcastClient {
 
     public struct ServerInfo: Sendable, Equatable {
@@ -28,17 +29,26 @@ public actor NarrowcastClient {
         case disconnected
     }
 
-    public enum ConnectError: Error {
+    public enum ConnectError: Error, CustomStringConvertible {
         case authFailed
         case authTimeout
         case welcomeTimeout
         case transport(Error)
+
+        public var description: String {
+            switch self {
+            case .authFailed:    return "Authentication failed"
+            case .authTimeout:   return "Auth timed out — relay didn't reply"
+            case .welcomeTimeout: return "Welcome timed out — server didn't reply"
+            case .transport(let e): return "Transport: \(e)"
+            }
+        }
     }
 
     public struct Config: Sendable {
         public let host: String
         public let port: UInt16
-        public let password: String?     // nil = direct Pi (no relay auth)
+        public let password: String?
         public let mode: QUICTransport.Mode
 
         public init(host: String, port: UInt16, password: String?, mode: QUICTransport.Mode) {
@@ -56,7 +66,8 @@ public actor NarrowcastClient {
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     public let events: AsyncStream<Event>
 
-    private var serverInfo: ServerInfo?
+    private var authWaiter: OneShot<Void>?
+    private var welcomeWaiter: OneShot<ServerInfo>?
     private var pumpTask: Task<Void, Never>?
 
     public init(config: Config) {
@@ -68,7 +79,9 @@ public actor NarrowcastClient {
     }
 
     /// Connect, authenticate (if password set), send Hello, wait for Welcome.
-    /// On success the inbound pump is running; consume `events`.
+    /// Starts the inbound pump immediately after the transport is ready so
+    /// auth/welcome replies are observed via one-shot waiters routed by the
+    /// pump (AsyncStream supports only one iterator).
     public func connect() async throws -> ServerInfo {
         do {
             try await transport.connect()
@@ -76,21 +89,23 @@ public actor NarrowcastClient {
             throw ConnectError.transport(error)
         }
 
-        if let password {
-            try await performAuth(password: password)
-        }
-
-        try await transport.send(ClientMessage.hello().encode())
-
-        // Pump runs until the transport closes. The first non-trivial frame
-        // we expect is Welcome — surface it to the caller as the resolved
-        // value of connect(), then keep pumping for the rest of the session.
-        let welcomePromise = WelcomeWaiter()
+        // Pump must be running before we send anything that expects a reply
+        // — otherwise the reply could land before we start consuming inbound.
         pumpTask = Task { [weak self] in
-            await self?.runPump(welcomeWaiter: welcomePromise)
+            await self?.runPump()
         }
 
-        return try await welcomePromise.value
+        if let password {
+            let waiter = OneShot<Void>(timeout: 5.0, onTimeout: ConnectError.authTimeout)
+            self.authWaiter = waiter
+            try await transport.send(ClientMessage.auth(passwordHash: PasswordHash.sha256(password)).encode())
+            try await waiter.value
+        }
+
+        let welcome = OneShot<ServerInfo>(timeout: 5.0, onTimeout: ConnectError.welcomeTimeout)
+        self.welcomeWaiter = welcome
+        try await transport.send(ClientMessage.hello().encode())
+        return try await welcome.value
     }
 
     public func send(_ message: ClientMessage) async throws {
@@ -106,38 +121,24 @@ public actor NarrowcastClient {
         eventsContinuation = nil
     }
 
-    // MARK: - Private
+    // MARK: - Pump
 
-    private func performAuth(password: String) async throws {
-        let hash = PasswordHash.sha256(password)
-        try await transport.send(ClientMessage.auth(passwordHash: hash).encode())
-
-        // Wait up to 5 s for AuthOK / AuthFail. Any other frame received in
-        // this window is dropped — auth must be the first response.
-        let deadline = Date().addingTimeInterval(5.0)
+    private func runPump() async {
         for await datagram in transport.inbound {
-            if Date() > deadline { break }
             guard let msg = ServerMessage.decode(datagram) else { continue }
             switch msg {
             case .authOK:
-                return
-            case .authFail:
-                throw ConnectError.authFailed
-            default:
-                continue
-            }
-        }
-        throw ConnectError.authTimeout
-    }
+                await authWaiter?.fulfill(.success(()))
+                authWaiter = nil
 
-    private func runPump(welcomeWaiter: WelcomeWaiter) async {
-        for await datagram in transport.inbound {
-            guard let msg = ServerMessage.decode(datagram) else { continue }
-            switch msg {
+            case .authFail:
+                await authWaiter?.fulfill(.failure(ConnectError.authFailed))
+                authWaiter = nil
+
             case .welcome(let v, let lo, let hi, let sr):
                 let info = ServerInfo(protocolVersion: v, minHz: lo, maxHz: hi, sampleRate: sr)
-                self.serverInfo = info
-                await welcomeWaiter.fulfill(info)
+                await welcomeWaiter?.fulfill(.success(info))
+                welcomeWaiter = nil
                 eventsContinuation?.yield(.welcome(info))
 
             case .audio(let opus):
@@ -157,45 +158,66 @@ public actor NarrowcastClient {
                     eventsContinuation?.yield(.loss(sample))
                 }
 
-            case .authOK, .authFail:
-                continue // already handled in performAuth phase
-
             case .unknown(let t):
                 eventsContinuation?.yield(.unknown(typeByte: t))
             }
         }
         eventsContinuation?.yield(.disconnected)
+        eventsContinuation?.finish()
+        eventsContinuation = nil
     }
 }
 
-// Internal: a one-shot async waiter used to fulfill `connect()`'s return
-// value when the first Welcome arrives.
-fileprivate actor WelcomeWaiter {
-    private var info: NarrowcastClient.ServerInfo?
-    private var continuation: CheckedContinuation<NarrowcastClient.ServerInfo, Error>?
+// OneShot is a single-fulfilment async waiter with a deadline. Used to bridge
+// individual handshake replies into structured async/await control flow.
+fileprivate actor OneShot<T: Sendable> {
+    private var resolved: Result<T, Error>?
+    private var continuation: CheckedContinuation<T, Error>?
+    private let timeout: TimeInterval
+    private let onTimeoutError: Error
+    private var timeoutTask: Task<Void, Never>?
 
-    var value: NarrowcastClient.ServerInfo {
+    init(timeout: TimeInterval, onTimeout: Error) {
+        self.timeout = timeout
+        self.onTimeoutError = onTimeout
+    }
+
+    var value: T {
         get async throws {
-            if let info { return info }
+            if let resolved {
+                switch resolved {
+                case .success(let v): return v
+                case .failure(let e): throw e
+                }
+            }
             return try await withCheckedThrowingContinuation { cc in
                 self.continuation = cc
-                Task { await self.startTimeout() }
+                self.timeoutTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64((self?.timeout ?? 5) * 1_000_000_000))
+                    await self?.fireTimeout()
+                }
             }
         }
     }
 
-    func fulfill(_ info: NarrowcastClient.ServerInfo) {
-        guard self.info == nil else { return }
-        self.info = info
-        continuation?.resume(returning: info)
+    func fulfill(_ result: Result<T, Error>) {
+        guard resolved == nil else { return }
+        resolved = result
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        guard let cc = continuation else { return }
         continuation = nil
+        switch result {
+        case .success(let v): cc.resume(returning: v)
+        case .failure(let e): cc.resume(throwing: e)
+        }
     }
 
-    private func startTimeout() async {
-        try? await Task.sleep(nanoseconds: 5_000_000_000)
-        if info == nil {
-            continuation?.resume(throwing: NarrowcastClient.ConnectError.welcomeTimeout)
-            continuation = nil
-        }
+    private func fireTimeout() {
+        guard resolved == nil else { return }
+        resolved = .failure(onTimeoutError)
+        guard let cc = continuation else { return }
+        continuation = nil
+        cc.resume(throwing: onTimeoutError)
     }
 }

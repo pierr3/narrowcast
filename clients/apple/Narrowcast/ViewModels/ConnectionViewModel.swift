@@ -129,7 +129,10 @@ final class ConnectionViewModel: ObservableObject {
         switch event {
         case .welcome(let info):
             serverInfo = info
-        case .audio(_):
+        case .audio:
+            // Decoder + AVAudioEngine playback land with the libopus xcframework
+            // (Phase 4 task: vendor opus). For now we just count packets so the
+            // UI shows the audio path is live.
             audioPacketsReceived &+= 1
         case .fft(let bins):
             fftFrameLatest = bins
