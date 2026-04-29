@@ -36,6 +36,10 @@ CLIENT_PASSWORD=${client_pw}
 ENVEOF
         sudo chown narrowcast:narrowcast /etc/narrowcast-relay/relay.env
         sudo chmod 600 /etc/narrowcast-relay/relay.env
+        echo "==> Created /etc/narrowcast-relay/relay.env"
+    else
+        echo "==> /etc/narrowcast-relay/relay.env already exists — leaving untouched."
+        echo "    To regenerate keys, delete it and rerun this script."
     fi
 
     echo ""
