@@ -69,7 +69,13 @@ public actor QUICTransport {
         // Inbound datagrams are delivered here. content/isComplete are unused
         // for datagram payloads — each invocation is a complete datagram.
         group.setReceiveHandler(maximumMessageSize: 65535, rejectOversizedMessages: false) { [weak self] _, content, _ in
-            guard let self, let content, !content.isEmpty else { return }
+            guard let self else { return }
+            guard let content, !content.isEmpty else {
+                NSLog("[narrowcast] inbound: empty/no content (handshake artifact)")
+                return
+            }
+            let head = content.prefix(1).map { String(format: "0x%02x", $0) }.joined()
+            NSLog("[narrowcast] inbound: \(content.count)B head=\(head)")
             Task { await self.deliverInbound(content) }
         }
 
@@ -77,6 +83,7 @@ public actor QUICTransport {
             let resumeBox = ResumeOnce(cc)
             group.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
+                NSLog("[narrowcast] state: \(state)")
                 switch state {
                 case .ready:
                     resumeBox.resume(.success(()))
@@ -96,9 +103,12 @@ public actor QUICTransport {
 
     public func send(_ datagram: Data) async throws {
         guard let group = self.group else { throw TransportError.notConnected }
+        let head = datagram.prefix(1).map { String(format: "0x%02x", $0) }.joined()
+        NSLog("[narrowcast] send: \(datagram.count)B head=\(head)")
         try await withCheckedThrowingContinuation { (cc: CheckedContinuation<Void, Error>) in
             group.send(content: datagram) { err in
                 if let err {
+                    NSLog("[narrowcast] send err: \(err)")
                     cc.resume(throwing: TransportError.sendFailed(err))
                 } else {
                     cc.resume()

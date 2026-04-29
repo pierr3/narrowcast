@@ -124,18 +124,25 @@ public actor NarrowcastClient {
     // MARK: - Pump
 
     private func runPump() async {
+        NSLog("[narrowcast] pump: started")
         for await datagram in transport.inbound {
-            guard let msg = ServerMessage.decode(datagram) else { continue }
+            guard let msg = ServerMessage.decode(datagram) else {
+                NSLog("[narrowcast] pump: undecodable \(datagram.count)B")
+                continue
+            }
             switch msg {
             case .authOK:
+                NSLog("[narrowcast] pump: AuthOK")
                 await authWaiter?.fulfill(.success(()))
                 authWaiter = nil
 
             case .authFail:
+                NSLog("[narrowcast] pump: AuthFail")
                 await authWaiter?.fulfill(.failure(ConnectError.authFailed))
                 authWaiter = nil
 
             case .welcome(let v, let lo, let hi, let sr):
+                NSLog("[narrowcast] pump: Welcome v=\(v) sr=\(sr)")
                 let info = ServerInfo(protocolVersion: v, minHz: lo, maxHz: hi, sampleRate: sr)
                 await welcomeWaiter?.fulfill(.success(info))
                 welcomeWaiter = nil
