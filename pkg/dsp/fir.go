@@ -121,6 +121,17 @@ func (f *XlatingFilter) Process(input []complex128) []complex128 {
 	return output
 }
 
+// Reset zeroes the history buffer and resets the derotator phase. Call after
+// a hardware retune or pipeline drop so stale samples don't bleed into the
+// next FIR convolution as a transient.
+func (f *XlatingFilter) Reset() {
+	for i := range f.history {
+		f.history[i] = 0
+	}
+	f.pos = 0
+	f.phase = complex(1, 0)
+}
+
 // RealFIRFilter applies a real-valued FIR filter to audio samples with decimation.
 type RealFIRFilter struct {
 	taps    []float64
@@ -162,6 +173,15 @@ func (f *RealFIRFilter) Process(input []float64) []float64 {
 		}
 	}
 	return output
+}
+
+// Reset zeroes the history buffer and decimation phase counter.
+func (f *RealFIRFilter) Reset() {
+	for i := range f.history {
+		f.history[i] = 0
+	}
+	f.pos = 0
+	f.count = 0
 }
 
 // CU8ToComplex converts interleaved unsigned 8-bit IQ samples to complex128.

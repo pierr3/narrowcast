@@ -8,6 +8,7 @@ import (
 	"math"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -66,6 +67,11 @@ func run(ctx context.Context, cfg *config.Config) error {
 	// IQ sample fan-out: SDR callback pushes to a channel, pipeline goroutine consumes
 	iqChan := make(chan []byte, 16)
 
+	// Drop counter: SDR callback increments when iqChan is full. The pipeline
+	// observes increases and resets DSP state — continuing to filter with
+	// stale FIR/IIR history after a buffer gap produces audible warbling.
+	state.dropCount = &atomic.Uint64{}
+
 	// Start SDR async read in a goroutine
 	go func() {
 		bufSize := cfg.SampleRate / 10 * 2 // ~100ms of CU8 data
@@ -76,7 +82,8 @@ func run(ctx context.Context, cfg *config.Config) error {
 			select {
 			case iqChan <- cp:
 			default:
-				// Drop if pipeline can't keep up
+				// Pipeline can't keep up — drop and signal so it resets state.
+				state.dropCount.Add(1)
 			}
 		}, 12, bufSize)
 		if err != nil {
@@ -110,6 +117,11 @@ type serverState struct {
 	mode      protocol.DemodMode
 	freqHz    uint64
 	squelchDb float32
+
+	// dropCount is incremented by the SDR callback whenever iqChan is full.
+	// The pipeline tracks the last observed value and resets DSP state when
+	// it increases, so we don't keep filtering across a discontinuity.
+	dropCount *atomic.Uint64
 }
 
 func handleClient(ctx context.Context, conn quic.Connection, state *serverState, iqChan <-chan []byte) {
@@ -121,6 +133,10 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 	streaming := false
 	stopStreaming := make(chan struct{})
 	modeChan := make(chan protocol.DemodMode, 1)
+	// flushChan signals the pipeline to drain stale IQ buffers and reset DSP
+	// state — used after a hardware retune so the listener doesn't hear a
+	// transient pop while old samples drain through the filters.
+	flushChan := make(chan struct{}, 1)
 	var streamWg sync.WaitGroup
 
 	defer func() {
@@ -179,6 +195,12 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			if err := state.dev.SetCenterFreq(hz); err != nil {
 				log.Printf("[client %s] set freq: %v", remote, err)
 			}
+			// Tell the pipeline to drain stale IQ and reset DSP state so the
+			// retune is heard as a clean cut, not a swept artifact.
+			select {
+			case flushChan <- struct{}{}:
+			default:
+			}
 			log.Printf("[client %s] freq → %d Hz", remote, hz)
 
 		case protocol.CmdSetMode:
@@ -229,7 +251,7 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			streamWg.Add(1)
 			go func() {
 				defer streamWg.Done()
-				runPipeline(ctx, conn, state, iqChan, stopStreaming, modeChan)
+				runPipeline(ctx, conn, state, iqChan, stopStreaming, modeChan, flushChan)
 			}()
 			log.Printf("[client %s] streaming started", remote)
 
@@ -244,18 +266,58 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 	}
 }
 
+// gainStage is satisfied by any AGC variant — both pkg/dsp.AGC (FM) and
+// pkg/dsp.AudioAGC (AM hang-time) implement Process and Reset.
+type gainStage interface {
+	Process([]float64)
+	Reset()
+}
+
 // buildDSPChain constructs the DSP objects for a given demod mode.
 type dspChain struct {
 	xlat        *dsp.XlatingFilter
+	fmDemod     *dsp.FMDemodulator // non-nil for NFM/WFM
+	amDemod     *dsp.AMDemodulator // non-nil for AM
 	demodFn     func([]complex128) []float64
 	deemph      *dsp.DeEmphasis
-	audioDecimF *dsp.RealFIRFilter  // anti-aliased decimation filter (nil if no decimation needed)
-	voiceHPF    *dsp.HighPassIIR    // voice bandpass high-pass (AM only)
-	voiceLPF    *dsp.RealFIRFilter  // voice bandpass low-pass (AM only)
-	limiter     *dsp.SoftLimiter     // soft clipper for ADC saturation
-	agc         *dsp.AGC            // automatic gain control
+	audioDecimF *dsp.RealFIRFilter // anti-aliased decimation filter (nil if no decimation needed)
+	voiceHPF    *dsp.HighPassIIR   // voice bandpass high-pass (AM only)
+	voiceLPF    *dsp.RealFIRFilter // voice bandpass low-pass (AM only)
+	limiter     *dsp.SoftLimiter   // soft clipper for ADC saturation
+	gain        gainStage          // AGC (FM) or hang-time AudioAGC (AM)
 	opusEnc     *audio.OpusEncoder
 	audioRate   int
+}
+
+// Reset clears every stateful stage in the chain. Called after a hardware
+// retune (drains transient samples from filter histories) and after the SDR
+// callback has dropped buffers (continuity is broken so old history is
+// noise, not signal).
+func (c *dspChain) Reset() {
+	if c.xlat != nil {
+		c.xlat.Reset()
+	}
+	if c.fmDemod != nil {
+		c.fmDemod.Reset()
+	}
+	if c.amDemod != nil {
+		c.amDemod.Reset()
+	}
+	if c.deemph != nil {
+		c.deemph.Reset()
+	}
+	if c.audioDecimF != nil {
+		c.audioDecimF.Reset()
+	}
+	if c.voiceHPF != nil {
+		c.voiceHPF.Reset()
+	}
+	if c.voiceLPF != nil {
+		c.voiceLPF.Reset()
+	}
+	if c.gain != nil {
+		c.gain.Reset()
+	}
 }
 
 func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*dspChain, error) {
@@ -307,18 +369,20 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 
 	var demodFn func([]complex128) []float64
 	var deemph *dsp.DeEmphasis
+	var fmDemod *dsp.FMDemodulator
+	var amDemod *dsp.AMDemodulator
 
 	switch mode {
 	case protocol.ModeNFM:
-		fmDemod := dsp.NewFMDemodulator(5000, decimatedRate)
+		fmDemod = dsp.NewFMDemodulator(5000, decimatedRate)
 		deemph = dsp.NewDeEmphasis(50e-6, float64(audioRate))
 		demodFn = fmDemod.Demodulate
 	case protocol.ModeWFM:
-		fmDemod := dsp.NewFMDemodulator(75000, decimatedRate)
+		fmDemod = dsp.NewFMDemodulator(75000, decimatedRate)
 		deemph = dsp.NewDeEmphasis(50e-6, float64(audioRate))
 		demodFn = fmDemod.Demodulate
 	case protocol.ModeAM:
-		amDemod := dsp.NewAMDemodulator()
+		amDemod = dsp.NewAMDemodulator()
 		demodFn = amDemod.Demodulate
 	}
 
@@ -344,16 +408,18 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		limiter = dsp.NewSoftLimiter(2.0)
 	}
 
-	// AGC: -12 dBFS target, max 30 dB gain.
-	// AM uses slower attack (50ms) to avoid pumping on speech dynamics.
-	// FM uses faster attack (20ms) since amplitude doesn't carry information.
-	agcAttack := 20.0
-	agcRelease := 500.0
+	// AM: hang-time AudioAGC. Standard AGC ramps gain into the noise floor
+	// between transmissions and clips the start of the next one while attack
+	// catches up. Hang-time AGC freezes gain during dead air so the next
+	// transmission starts at the correct level instantly.
+	// FM: regular AGC — amplitude doesn't carry info, fast attack is fine.
+	var gain gainStage
 	if mode == protocol.ModeAM {
-		agcAttack = 50.0
-		agcRelease = 1000.0
+		gain = dsp.NewAudioAGC(0.17, 0.1, 0.001, 500.0, float64(audioRate), 0.02)
+		log.Printf("[dsp] AM hang-time AudioAGC: hang=500ms minMag=0.02")
+	} else {
+		gain = dsp.NewAGC(-12, 30, 20.0, 500.0, float64(audioRate))
 	}
-	agc := dsp.NewAGC(-12, 30, agcAttack, agcRelease, float64(audioRate))
 
 	opusEnc, err := audio.NewOpusEncoder(audioRate, opusBitrate)
 	if err != nil {
@@ -362,20 +428,22 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 
 	return &dspChain{
 		xlat:        xlat,
+		fmDemod:     fmDemod,
+		amDemod:     amDemod,
 		demodFn:     demodFn,
 		deemph:      deemph,
 		audioDecimF: audioDecimF,
 		voiceHPF:    voiceHPF,
 		voiceLPF:    voiceLPF,
 		limiter:     limiter,
-		agc:         agc,
+		gain:        gain,
 		opusEnc:     opusEnc,
 		audioRate:   audioRate,
 	}, nil
 }
 
 // runPipeline reads IQ data, demodulates, encodes, and sends datagrams.
-func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, iqChan <-chan []byte, stop <-chan struct{}, modeChan <-chan protocol.DemodMode) {
+func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, iqChan <-chan []byte, stop <-chan struct{}, modeChan <-chan protocol.DemodMode, flushChan <-chan struct{}) {
 	state.mu.RLock()
 	mode := state.mode
 	sampleRate := state.cfg.SampleRate
@@ -389,6 +457,11 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 		log.Printf("[pipeline] dsp chain error: %v", err)
 		return
 	}
+
+	// Track SDR drop count to detect IQ-buffer gaps. On increase we reset all
+	// DSP state and skip the next block to avoid filtering across a
+	// discontinuity (which sounds like warbling artifacts).
+	lastDrops := state.dropCount.Load()
 
 	// FFT state
 	fftBuf := make([]complex128, 0, fftSize)
@@ -419,9 +492,41 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 			fftBuf = fftBuf[:0]
 			log.Printf("[pipeline] DSP chain rebuilt for mode %s", mode)
 
+		case <-flushChan:
+			// Hardware was retuned. Drop any IQ buffered before the retune
+			// (they're at the OLD frequency) and reset every stateful DSP
+			// stage so post-retune audio doesn't carry pre-retune transient.
+			drained := 0
+		drainLoop:
+			for {
+				select {
+				case <-iqChan:
+					drained++
+				default:
+					break drainLoop
+				}
+			}
+			chain.Reset()
+			fftBuf = fftBuf[:0]
+			// Sync the drop-counter baseline: drops we just discarded shouldn't
+			// trigger another reset on the next block.
+			lastDrops = state.dropCount.Load()
+			log.Printf("[pipeline] flush: drained %d stale IQ buffers, DSP reset", drained)
+
 		case rawBuf, ok := <-iqChan:
 			if !ok {
 				return
+			}
+
+			// If the SDR callback dropped any buffers since the last block, the
+			// stream has a gap. Continuing with stale FIR/IIR history produces
+			// audible warbling — reset state and skip this block.
+			if d := state.dropCount.Load(); d != lastDrops {
+				dropped := d - lastDrops
+				lastDrops = d
+				chain.Reset()
+				log.Printf("[pipeline] %d IQ drops detected, DSP reset", dropped)
+				continue
 			}
 
 			// Convert CU8 → complex
@@ -523,8 +628,8 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				continue
 			}
 
-			// AGC: smooth gain control
-			chain.agc.Process(audioSamples)
+			// AGC: smooth gain control (regular AGC for FM, hang-time for AM).
+			chain.gain.Process(audioSamples)
 
 			// Opus encode
 			packets, err := chain.opusEnc.Encode(audioSamples)

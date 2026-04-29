@@ -34,6 +34,12 @@ func (d *FMDemodulator) Demodulate(input []complex128) []float64 {
 	return output
 }
 
+// Reset clears the prev-sample state. Call after a hardware retune or on
+// pipeline drop to avoid a phase-discontinuity glitch in the audio.
+func (d *FMDemodulator) Reset() {
+	d.prev = complex(1, 0)
+}
+
 // AMDemodulator performs AM demodulation using envelope detection
 // with a proper DC blocking filter.
 type AMDemodulator struct {
@@ -56,6 +62,11 @@ func (d *AMDemodulator) Demodulate(input []complex128) []float64 {
 	}
 	d.dcBlock.Process(output)
 	return output
+}
+
+// Reset clears the DC blocker state.
+func (d *AMDemodulator) Reset() {
+	d.dcBlock.Reset()
 }
 
 // DCBlocker is a single-pole high-pass IIR filter that removes DC offset.
@@ -82,6 +93,12 @@ func (d *DCBlocker) Process(samples []float64) {
 		d.yPrev = y
 		samples[i] = y
 	}
+}
+
+// Reset clears the IIR state.
+func (d *DCBlocker) Reset() {
+	d.xPrev = 0
+	d.yPrev = 0
 }
 
 // NoiseGate applies a soft noise gate with attack/release smoothing.
@@ -190,6 +207,11 @@ func (f *HighPassIIR) Process(samples []float64) {
 	}
 }
 
+// Reset clears biquad delay-line state.
+func (f *HighPassIIR) Reset() {
+	f.x1, f.x2, f.y1, f.y2 = 0, 0, 0, 0
+}
+
 // SoftLimiter applies tanh-based soft clipping to prevent harsh distortion
 // from ADC saturation on strong signals. Compresses loud signals smoothly
 // instead of hard-clipping.
@@ -258,6 +280,107 @@ func (a *AGC) Process(samples []float64) {
 	}
 }
 
+// Reset re-seeds the envelope follower so the next block doesn't apply gain
+// computed from a stale (pre-retune / pre-drop) signal level.
+func (a *AGC) Reset() {
+	a.envLevel = 0.001
+}
+
+// AudioAGC is a post-demodulation AGC with hang-time and noise-floor freeze.
+//
+// Designed for AM/SSB where transmissions are bursty: a regular AGC ramps
+// gain up into the noise floor between transmissions, then clips the start
+// of the next transmission while attack catches up. AudioAGC instead:
+//
+//   - Tracks a fast-attack / slow-release envelope.
+//   - When the envelope falls below minMagnitude (dead air), gain is FROZEN.
+//     No noise amplification, no pumping.
+//   - When a new transmission arrives, attack pulls gain down immediately
+//     and arms a hang counter.
+//   - Decay only proceeds after the hang counter expires AND the envelope
+//     stays above minMagnitude. This prevents pumping on speech dynamics.
+type AudioAGC struct {
+	target       float64
+	attack       float64
+	decay        float64
+	minMagnitude float64
+	hangSamples  int
+	hangCounter  int
+	envelope     float64
+	gain         float64
+}
+
+// NewAudioAGC creates a hang-time AGC.
+//
+//	target       — desired output amplitude (linear, e.g., 0.17 ≈ -15 dBFS)
+//	attack       — coefficient (0..1), e.g., 0.1 (fast)
+//	decay        — coefficient (0..1), e.g., 0.001 (slow)
+//	hangMs       — gain-hold time after signal drops, e.g., 500 ms
+//	sampleRate   — audio sample rate (Hz)
+//	minMagnitude — envelope floor below which gain is frozen, e.g., 0.02
+func NewAudioAGC(target, attack, decay, hangMs, sampleRate, minMagnitude float64) *AudioAGC {
+	return &AudioAGC{
+		target:       target,
+		attack:       attack,
+		decay:        decay,
+		minMagnitude: minMagnitude,
+		hangSamples:  int(hangMs * sampleRate / 1000.0),
+		gain:         1.0,
+	}
+}
+
+// Process applies the AGC in-place.
+func (a *AudioAGC) Process(samples []float64) {
+	for i, s := range samples {
+		mag := math.Abs(s)
+
+		// Fast-attack, slow-release envelope follower.
+		if mag > a.envelope {
+			a.envelope = mag
+		} else {
+			a.envelope = 0.999*a.envelope + 0.001*mag
+		}
+
+		if a.envelope < a.minMagnitude {
+			// Dead air — freeze gain to avoid amplifying noise.
+			if a.hangCounter > 0 {
+				a.hangCounter--
+			}
+			samples[i] = s * a.gain
+			continue
+		}
+
+		err := a.target / (a.envelope + 1e-6)
+		if err < a.gain {
+			// Signal louder than target — attack down, arm hang.
+			a.gain = (1.0-a.attack)*a.gain + a.attack*err
+			a.hangCounter = a.hangSamples
+		} else {
+			// Signal quieter — only decay after hang expires.
+			if a.hangCounter > 0 {
+				a.hangCounter--
+			} else {
+				a.gain = (1.0-a.decay)*a.gain + a.decay*err
+			}
+		}
+
+		out := s * a.gain
+		if out > 1.0 {
+			out = 1.0
+		} else if out < -1.0 {
+			out = -1.0
+		}
+		samples[i] = out
+	}
+}
+
+// Reset clears envelope, gain, and hang state.
+func (a *AudioAGC) Reset() {
+	a.envelope = 0
+	a.gain = 1.0
+	a.hangCounter = 0
+}
+
 // DeEmphasis applies a simple single-pole de-emphasis filter.
 // Used for NFM to restore the original audio frequency response.
 type DeEmphasis struct {
@@ -280,4 +403,9 @@ func (d *DeEmphasis) Process(samples []float64) {
 		samples[i] = d.prev + d.alpha*(samples[i]-d.prev)
 		d.prev = samples[i]
 	}
+}
+
+// Reset clears the IIR state.
+func (d *DeEmphasis) Reset() {
+	d.prev = 0
 }
