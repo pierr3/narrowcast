@@ -161,8 +161,13 @@ narrowcast [flags]
 # Install C deps
 sudo apt install librtlsdr-dev libopus-dev libopusfile-dev
 
-# Increase UDP buffer (add to /etc/sysctl.conf for persistence)
-sudo sysctl -w net.core.rmem_max=7500000
+# Increase UDP buffer ceilings so QUIC can size its socket buffers properly.
+# install.sh handles this automatically; the manual form is:
+sudo tee /etc/sysctl.d/99-narrowcast.conf > /dev/null <<EOF
+net.core.rmem_max=7500000
+net.core.wmem_max=7500000
+EOF
+sudo sysctl --system
 
 # Run
 ./narrowcast --host 0.0.0.0 --port 4444

@@ -4,6 +4,20 @@ set -euo pipefail
 echo "Narrowcast installer"
 echo "===================="
 echo ""
+
+# QUIC needs a roomy UDP buffer or the kernel drops bursts and quic-go logs
+# a noisy "failed to sufficiently increase receive buffer size" warning. Set
+# this everywhere narrowcast runs (relay, narrowcast server, uplink).
+echo "==> Configuring UDP buffer sizes for QUIC..."
+sudo tee /etc/sysctl.d/99-narrowcast.conf > /dev/null <<SYSCTLEOF
+# narrowcast: lift UDP buffer ceilings so quic-go can size its socket buffers
+# above the default 208 kiB. 7.5 MB is the value quic-go wants.
+net.core.rmem_max=7500000
+net.core.wmem_max=7500000
+SYSCTLEOF
+sudo sysctl --system > /dev/null
+
+echo ""
 echo "What would you like to install?"
 echo "  1) Relay only (no hardware deps, runs on VPS)"
 echo "  2) SDR server + uplink (runs on Pi with RTL-SDR)"
