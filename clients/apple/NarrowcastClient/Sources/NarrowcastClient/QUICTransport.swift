@@ -33,6 +33,7 @@ public actor QUICTransport {
     private let alpn: String
 
     private var group: NWConnectionGroup?
+    private var streamConnection: NWConnection?
     private var inboundContinuation: AsyncStream<Data>.Continuation?
 
     public let inbound: AsyncStream<Data>
@@ -49,9 +50,13 @@ public actor QUICTransport {
 
     public func connect() async throws {
         let quicOpts = NWProtocolQUIC.Options(alpn: [alpn])
-        // RFC 9221 datagrams. Value 0 silently disables them — server uses
-        // datagrams for everything, so 0 means no traffic.
-        quicOpts.maxDatagramFrameSize = 65535
+        // Two flags are needed for RFC 9221 datagrams over Network.framework
+        // QUIC. Without `isDatagram = true` the connection establishes but
+        // group.send transmits no datagram frames — the server sees nothing.
+        // (Reference: alta/swift-quic-datagram-example.) 1220 bytes is safely
+        // under typical UDP MTU and what most QUIC stacks negotiate by default.
+        quicOpts.isDatagram = true
+        quicOpts.maxDatagramFrameSize = 1220
         quicOpts.idleTimeout = 30_000
 
         configureSecurity(quicOpts.securityProtocolOptions)
@@ -66,9 +71,11 @@ public actor QUICTransport {
         let group = NWConnectionGroup(with: descriptor, using: params)
         self.group = group
 
-        // Inbound datagrams are delivered here. content/isComplete are unused
-        // for datagram payloads — each invocation is a complete datagram.
-        group.setReceiveHandler(maximumMessageSize: 65535, rejectOversizedMessages: false) { [weak self] _, content, _ in
+        // Inbound datagrams arrive here. The simpler setReceiveHandler form
+        // is what the working example uses; the one with explicit max size +
+        // rejectOversized parameters appears not to be wired up for QUIC
+        // datagram delivery.
+        group.setReceiveHandler { [weak self] _, content, _ in
             guard let self else { return }
             guard let content, !content.isEmpty else {
                 NSLog("[narrowcast] inbound: empty/no content (handshake artifact)")
@@ -99,6 +106,18 @@ public actor QUICTransport {
             }
             group.start(queue: .global(qos: .userInitiated))
         }
+
+        // After the group is ready, extract an NWConnection from it. The
+        // working datagram example does this even though it never sends on
+        // the resulting stream — apparently QUIC's state machine on the
+        // Apple side wants a connection object alive for traffic to flow.
+        if let conn = NWConnection(from: group) {
+            conn.stateUpdateHandler = { state in
+                NSLog("[narrowcast] stream state: \(state)")
+            }
+            conn.start(queue: .global(qos: .userInitiated))
+            self.streamConnection = conn
+        }
     }
 
     public func send(_ datagram: Data) async throws {
@@ -118,6 +137,8 @@ public actor QUICTransport {
     }
 
     public func close() {
+        streamConnection?.cancel()
+        streamConnection = nil
         group?.cancel()
         group = nil
         inboundContinuation?.finish()
