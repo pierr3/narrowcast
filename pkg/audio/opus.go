@@ -26,6 +26,18 @@ func NewOpusEncoder(sampleRate, bitrate int) (*OpusEncoder, error) {
 	if err := enc.SetBitrate(bitrate); err != nil {
 		return nil, fmt.Errorf("opus set bitrate: %w", err)
 	}
+	// Enable in-band Forward Error Correction. The encoder hides a low-bitrate
+	// copy of the previous frame inside the current one, so a single dropped
+	// audio datagram can be reconstructed by the decoder instead of producing
+	// a 20 ms silent gap. Critical on mobile/poor-wifi where packet loss is
+	// common. Tell the encoder to assume ~10% loss so it allocates enough
+	// bits to redundancy. Cost: ~20-25% bitrate overhead on the active frame.
+	if err := enc.SetInBandFEC(true); err != nil {
+		return nil, fmt.Errorf("opus set FEC: %w", err)
+	}
+	if err := enc.SetPacketLossPerc(10); err != nil {
+		return nil, fmt.Errorf("opus set loss perc: %w", err)
+	}
 
 	// Opus frame size: 20ms worth of samples
 	frameSize := sampleRate * 20 / 1000
