@@ -6,8 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/narrowcast-relay/relay.env
+# UDP/443 is QUIC's default — widely allowed through hostile / public-wifi
+# firewalls that drop random high UDP ports. Binding <1024 needs the
+# CAP_NET_BIND_SERVICE capability (the narrowcast user is unprivileged).
 ExecStart=/usr/local/bin/narrowcast-relay \
-    -listen 0.0.0.0:4444 \
+    -listen 0.0.0.0:443 \
     -cert /etc/narrowcast-relay/certs/server.crt \
     -key /etc/narrowcast-relay/certs/server.key \
     -uplink-key ${UPLINK_KEY} \
@@ -17,6 +20,8 @@ Restart=always
 RestartSec=3
 User=narrowcast
 Group=narrowcast
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

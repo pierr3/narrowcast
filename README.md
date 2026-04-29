@@ -61,6 +61,8 @@ Reference: SpyServer ~200 KB/s. SDR++ raw IQ: 4–10 Mbps. Narrowcast is 15–50
 
 A typical deployment: `narrowcast` (server-side demod) on the Pi at the antenna, `narrowcast-uplink` bridging to a `narrowcast-relay` on a VPS with a real DNS name, clients connecting to the relay over QUIC. The Pi only needs a single outbound UDP connection — no port forwarding, no public IP.
 
+**The relay listens on UDP/443 by default** — QUIC's standard port (HTTP/3). Random high UDP ports get blocked by hostile public-wifi / corporate firewalls roughly half the time; UDP/443 gets through ~85% of restrictive networks because they whitelist QUIC. WireGuard on the same VPS does not conflict (default 51820/UDP) — verify with `sudo wg show | grep listening`. Some networks block all UDP regardless; that's a TCP-fallback problem we don't solve.
+
 ## Resilience
 
 The design assumes the network is bad and tries to fail gracefully:
