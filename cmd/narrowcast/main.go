@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -137,6 +138,10 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 	// state — used after a hardware retune so the listener doesn't hear a
 	// transient pop while old samples drain through the filters.
 	flushChan := make(chan struct{}, 1)
+	// qualityChan delivers client-reported loss measurements (0-100 %) so the
+	// pipeline can throttle FFT rate and reduce Opus bitrate. Not blocking
+	// audio path: best-effort drop on full.
+	qualityChan := make(chan qualityReport, 4)
 	var streamWg sync.WaitGroup
 
 	defer func() {
@@ -242,6 +247,28 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 				log.Printf("[client %s] set gain: %v", remote, err)
 			}
 
+		case protocol.CmdQualityReport:
+			// Client reports measured packet loss vs the server's seq-marks.
+			// Drives FFT throttle and Opus bitrate adaptation.
+			// Payload: [u8 audioLoss][u8 fftLoss][u16 windowMs]
+			if len(payload) < 4 {
+				continue
+			}
+			qr := qualityReport{
+				audioLossPct: payload[0],
+				fftLossPct:   payload[1],
+			}
+			select {
+			case qualityChan <- qr:
+			default:
+				// Drop oldest, push newest — staleness is worse than gap.
+				select {
+				case <-qualityChan:
+				default:
+				}
+				qualityChan <- qr
+			}
+
 		case protocol.CmdStart:
 			if streaming {
 				continue
@@ -251,7 +278,7 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			streamWg.Add(1)
 			go func() {
 				defer streamWg.Done()
-				runPipeline(ctx, conn, state, iqChan, stopStreaming, modeChan, flushChan)
+				runPipeline(ctx, conn, state, iqChan, stopStreaming, modeChan, flushChan, qualityChan)
 			}()
 			log.Printf("[client %s] streaming started", remote)
 
@@ -271,6 +298,75 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 type gainStage interface {
 	Process([]float64)
 	Reset()
+}
+
+// qualityReport carries the client's most recent loss measurement (0-100).
+// audioLossPct drives Opus bitrate + FEC adaptation.
+// fftLossPct drives FFT frame-rate throttling.
+type qualityReport struct {
+	audioLossPct byte
+	fftLossPct   byte
+}
+
+// adaptFFTInterval picks an FFT send interval based on measured loss.
+// Audio is the priority — at high loss we cut FFT bandwidth aggressively.
+//
+//	 < 2 %  →  full (configured rate, default 10 fps)
+//	 2-10 % →  half (5 fps default)
+//	10-25 % →  1/5  (2 fps default)
+//	 >25 %  →  1/10 (1 fps default)
+func adaptFFTInterval(base time.Duration, lossPct byte) time.Duration {
+	switch {
+	case lossPct < 2:
+		return base
+	case lossPct < 10:
+		return base * 2
+	case lossPct < 25:
+		return base * 5
+	default:
+		return base * 10
+	}
+}
+
+// adaptOpusBitrate picks an Opus bitrate based on measured loss.
+// Floors at 16 kbps — below that, Opus voice quality drops below acceptable
+// for the monitoring use case. We'd rather cut out cleanly than ship muddy
+// audio. The clean cutout is QUIC's default behavior when datagrams stop
+// flowing, so no extra logic needed at the floor.
+//
+//	 < 2 %  →  configured (default 32 kbps)
+//	 2-5 % →  24 kbps
+//	 >5 %  →  16 kbps  (floor)
+func adaptOpusBitrate(base int, lossPct byte) int {
+	const floor = 16000
+	if base < floor {
+		base = floor
+	}
+	switch {
+	case lossPct < 2:
+		return base
+	case lossPct < 5:
+		if base > 24000 {
+			return 24000
+		}
+		return base
+	default:
+		return floor
+	}
+}
+
+// adaptOpusLossPerc maps measured loss to the SetPacketLossPerc value the
+// encoder uses to allocate FEC redundancy bits. Slightly above measured
+// loss so FEC has headroom for short bursts.
+func adaptOpusLossPerc(lossPct byte) int {
+	v := int(lossPct) + 5
+	if v < 5 {
+		v = 5
+	}
+	if v > 50 {
+		v = 50
+	}
+	return v
 }
 
 // buildDSPChain constructs the DSP objects for a given demod mode.
@@ -443,16 +539,16 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 }
 
 // runPipeline reads IQ data, demodulates, encodes, and sends datagrams.
-func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, iqChan <-chan []byte, stop <-chan struct{}, modeChan <-chan protocol.DemodMode, flushChan <-chan struct{}) {
+func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, iqChan <-chan []byte, stop <-chan struct{}, modeChan <-chan protocol.DemodMode, flushChan <-chan struct{}, qualityChan <-chan qualityReport) {
 	state.mu.RLock()
 	mode := state.mode
 	sampleRate := state.cfg.SampleRate
 	fftSize := state.cfg.FFTSize
-	fftInterval := time.Second / time.Duration(state.cfg.FFTRate)
-	opusBitrate := state.cfg.OpusBitrate
+	baseFFTInterval := time.Second / time.Duration(state.cfg.FFTRate)
+	baseOpusBitrate := state.cfg.OpusBitrate
 	state.mu.RUnlock()
 
-	chain, err := buildDSPChain(mode, sampleRate, opusBitrate)
+	chain, err := buildDSPChain(mode, sampleRate, baseOpusBitrate)
 	if err != nil {
 		log.Printf("[pipeline] dsp chain error: %v", err)
 		return
@@ -462,6 +558,17 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 	// DSP state and skip the next block to avoid filtering across a
 	// discontinuity (which sounds like warbling artifacts).
 	lastDrops := state.dropCount.Load()
+
+	// Adaptive state. fftInterval and currentBitrate start at configured
+	// defaults and step down only when QualityReport indicates loss.
+	fftInterval := baseFFTInterval
+	currentBitrate := baseOpusBitrate
+
+	// Sequence counters — included in DatagramSeqMark every second. The client
+	// diffs these against its own receive counts to compute loss.
+	var audioSent, fftSent, statusSent uint32
+	const seqMarkInterval = 1 * time.Second
+	lastSeqMark := time.Now()
 
 	// FFT state
 	fftBuf := make([]complex128, 0, fftSize)
@@ -482,7 +589,7 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 			if newMode == mode {
 				continue
 			}
-			newChain, err := buildDSPChain(newMode, sampleRate, opusBitrate)
+			newChain, err := buildDSPChain(newMode, sampleRate, baseOpusBitrate)
 			if err != nil {
 				log.Printf("[pipeline] rebuild dsp chain: %v", err)
 				continue
@@ -490,7 +597,34 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 			chain = newChain
 			mode = newMode
 			fftBuf = fftBuf[:0]
+			// Re-apply current adaptive Opus settings to the freshly built encoder.
+			_ = chain.opusEnc.SetBitrate(currentBitrate)
 			log.Printf("[pipeline] DSP chain rebuilt for mode %s", mode)
+
+		case qr := <-qualityChan:
+			// Client reported its loss measurement. Adapt FFT rate and Opus
+			// bitrate so the audio path stays viable on a struggling network.
+			newFFTInterval := adaptFFTInterval(baseFFTInterval, qr.fftLossPct)
+			newBitrate := adaptOpusBitrate(baseOpusBitrate, qr.audioLossPct)
+			lossPerc := adaptOpusLossPerc(qr.audioLossPct)
+
+			if newFFTInterval != fftInterval {
+				log.Printf("[adapt] fft loss=%d%% interval %v→%v",
+					qr.fftLossPct, fftInterval, newFFTInterval)
+				fftInterval = newFFTInterval
+			}
+			if newBitrate != currentBitrate {
+				if err := chain.opusEnc.SetBitrate(newBitrate); err != nil {
+					log.Printf("[adapt] SetBitrate %d: %v", newBitrate, err)
+				} else {
+					log.Printf("[adapt] audio loss=%d%% bitrate %d→%d bps",
+						qr.audioLossPct, currentBitrate, newBitrate)
+					currentBitrate = newBitrate
+				}
+			}
+			if err := chain.opusEnc.SetPacketLossPerc(lossPerc); err != nil {
+				log.Printf("[adapt] SetPacketLossPerc %d: %v", lossPerc, err)
+			}
 
 		case <-flushChan:
 			// Hardware was retuned. Drop any IQ buffered before the retune
@@ -550,7 +684,9 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				dgram[1] = byte(len(bins) >> 8)
 				dgram[2] = byte(len(bins))
 				copy(dgram[3:], bins)
-				_ = conn.SendDatagram(dgram)
+				if err := conn.SendDatagram(dgram); err == nil {
+					fftSent++
+				}
 			}
 			// Keep FFT buffer bounded
 			if len(fftBuf) > fftSize*4 {
@@ -617,7 +753,21 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				copy(statusDgram[5:9], protocol.EncodeFloat32(sq))
 				statusDgram[9] = byte(m)
 				copy(statusDgram[10:18], protocol.EncodeUint64(freq))
-				_ = conn.SendDatagram(statusDgram)
+				if err := conn.SendDatagram(statusDgram); err == nil {
+					statusSent++
+				}
+			}
+
+			// Emit seq-mark periodically so the client can compute loss.
+			// Cheap (13 bytes/s) and crucial for any network adaptation.
+			if time.Since(lastSeqMark) >= seqMarkInterval {
+				lastSeqMark = time.Now()
+				mark := make([]byte, 13)
+				mark[0] = protocol.DatagramSeqMark
+				binary.LittleEndian.PutUint32(mark[1:5], audioSent)
+				binary.LittleEndian.PutUint32(mark[5:9], fftSent)
+				binary.LittleEndian.PutUint32(mark[9:13], statusSent)
+				_ = conn.SendDatagram(mark)
 			}
 
 			// Squelch gate: skip audio when signal is below threshold
@@ -643,7 +793,9 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				dgram := make([]byte, 1+len(pkt))
 				dgram[0] = protocol.DatagramAudio
 				copy(dgram[1:], pkt)
-				_ = conn.SendDatagram(dgram)
+				if err := conn.SendDatagram(dgram); err == nil {
+					audioSent++
+				}
 			}
 		}
 	}

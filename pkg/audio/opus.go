@@ -89,3 +89,17 @@ func (e *OpusEncoder) Encode(samples []float64) ([][]byte, error) {
 func (e *OpusEncoder) Reset() {
 	e.buf = e.buf[:0]
 }
+
+// SetBitrate retunes the encoder bitrate in bps. Safe to call mid-stream:
+// libopus adjusts smoothly without resetting state. The pipeline uses this
+// to drop fidelity when QualityReport indicates congestion (32 → 24 → 16k).
+func (e *OpusEncoder) SetBitrate(bitrate int) error {
+	return e.enc.SetBitrate(bitrate)
+}
+
+// SetPacketLossPerc tells the encoder how aggressively to allocate bits to
+// FEC redundancy. Higher values protect against more loss but spend more of
+// the active-frame bitrate on the redundant copy. Safe to call mid-stream.
+func (e *OpusEncoder) SetPacketLossPerc(pct int) error {
+	return e.enc.SetPacketLossPerc(pct)
+}

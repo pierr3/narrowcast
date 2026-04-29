@@ -33,6 +33,13 @@ const (
 	// DatagramStatus carries periodic telemetry.
 	// Payload: [float32 smeter_dbm][float32 squelch_dbm][uint8 demod_mode][uint64 freq_hz]
 	DatagramStatus byte = 0x03
+
+	// DatagramSeqMark carries the server's monotonic send-counts for each
+	// stream. Sent ~1× per second. Clients diff their own receive counts
+	// against these to compute loss rate, then return a CmdQualityReport.
+	// Payload: [uint32 audioSent][uint32 fftSent][uint32 statusSent]
+	// All counters are LE and reset to 0 when the pipeline starts.
+	DatagramSeqMark byte = 0x04
 )
 
 // --- Command types (reliable stream) ---
@@ -53,6 +60,18 @@ const (
 	// CmdSetGain sets the tuner gain.
 	// Payload: float32 (dB, or 0 for auto)
 	CmdSetGain byte = 0x13
+
+	// CmdQualityReport is sent periodically by the client (e.g. every 2 s)
+	// to report measured packet loss against the server's seq-marks. The
+	// server uses this to throttle the FFT frame rate and adapt the Opus
+	// bitrate so audio survives congested mobile / poor-wifi links.
+	//
+	// Loss is expressed as a 0-100 percentage of expected datagrams missing
+	// over the most recent measurement window. Clients should never block
+	// streaming on this report — it is purely advisory.
+	//
+	// Payload: [uint8 audioLossPct][uint8 fftLossPct][uint16 windowMs]
+	CmdQualityReport byte = 0x14
 
 	// CmdStart begins streaming.
 	// Payload: none.

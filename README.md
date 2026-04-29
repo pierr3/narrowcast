@@ -70,6 +70,7 @@ The design assumes the network is bad and tries to fail gracefully:
 - **Flush-on-retune**: changing frequency drains stale IQ and resets every DSP stage so the listener hears a clean cut, not a transient sweep.
 - **Reset-on-drop**: when the SDR pipeline can't keep up (slow client, congested network), DSP state is cleared at the boundary instead of filtering across a discontinuity. Brief silence beats sustained warbling artifacts.
 - **Hang-time AGC for AM**: gain freezes during dead air, so the first syllable of an aviation transmission isn't clipped while attack catches up.
+- **Adaptive bitrate / FFT throttle**: the server emits a `SeqMark` datagram once per second carrying its monotonic send-counts. Clients diff against their own receive counts and report measured loss back via `CmdQualityReport`. The server then steps Opus from 32 → 24 → 16 kbps and FFT from 10 → 5 → 2 → 1 fps based on loss. **16 kbps is a hard floor** — below that, voice quality drops below acceptable and we'd rather rely on QUIC's natural cutout than ship muddy audio. Old clients that don't send reports stay at full quality; the system is purely advisory and never blocks the audio path.
 - **Reconnect-with-backoff** on the uplink and clients.
 
 ## Demodulation modes
@@ -125,10 +126,12 @@ QUIC over UDP, TLS 1.3, single port (default 4444). Datagrams for everything —
 | `0x01` audio  | server→client  | Opus packet                                       |
 | `0x02` FFT    | server→client  | `[u16 numBins][u8 bins...]`                       |
 | `0x03` status | server→client  | `[f32 smeter][f32 squelch][u8 mode][u64 freq]…`   |
+| `0x04` seqmark| server→client  | `[u32 audioSent][u32 fftSent][u32 statusSent]` (1/s)|
 | `0x10` setfreq| client→server  | `[u64 freqHz]`                                    |
 | `0x11` setmode| client→server  | `[u8 mode]`                                       |
 | `0x12` squelch| client→server  | `[f32 dBm]`                                       |
 | `0x13` setgain| client→server  | `[f32 dB]` (0 = auto)                             |
+| `0x14` quality| client→server  | `[u8 audioLossPct][u8 fftLossPct][u16 windowMs]`  |
 | `0x20` start  | client→server  | (none)                                            |
 | `0x21` stop   | client→server  | (none)                                            |
 | `0x30` hello  | client→server  | `[u8 protoVer]`                                   |
@@ -169,7 +172,6 @@ Working: NFM/WFM/AM, S-meter, waterfall, live tuning, multi-client via relay (la
 
 On the roadmap, in priority order:
 
-1. **FFT auto-throttle on client congestion** — drop FFT rate when QUIC stats show RTT or loss spiking. Keeps audio prioritized when bandwidth gets tight.
-2. **Connection-quality status field** — surface RTT / loss to the client UI so users see "weak signal" instead of silence.
-3. **Per-client virtual VFO** — each client tunes independently within the hardware's capture window via per-client NCO. Multiple listeners on the same Pi without contention.
-4. **SSB (USB/LSB)** — for HF amateur with an upconverter.
+1. **Per-client virtual VFO** — each client tunes independently within the hardware's capture window via per-client NCO. Multiple listeners on the same Pi without contention.
+2. **Connection-quality status field** — surface measured loss / current bitrate to the client UI so users see "weak signal" instead of silently degraded audio.
+3. **SSB (USB/LSB)** — for HF amateur with an upconverter.
