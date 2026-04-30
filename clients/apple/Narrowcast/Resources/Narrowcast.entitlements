@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Keychain access. Without this entitlement, SecItem APIs return
+         errSecMissingEntitlement (-34018). The default group is the
+         app's bundle ID with the team prefix. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.pierr3.narrowcast</string>
+    </array>
+</dict>
+</plist>

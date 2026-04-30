@@ -90,10 +90,11 @@ final class ConnectionViewModel: ObservableObject {
                     self?.state = .connected
                     self?.bootAudio(sampleRate: 16000)
                 }
-                // Auto-start streaming. The previous "press Play to begin"
-                // UX confused testers — they expected audio on connect and
-                // saw silence + an eventual disconnect when QUIC idle-timed
-                // out before they realised what to tap.
+                // Settle: Apple QUIC on the simulator sometimes rejects an
+                // immediate post-handshake send with EINVAL. Half a second
+                // is enough for the QUIC state machine to commit before we
+                // queue CmdStart.
+                try? await Task.sleep(nanoseconds: 500_000_000)
                 try? await client.send(.start)
                 await MainActor.run { self?.streaming = true }
                 let holder = await MainActor.run { self?.pipelineHolder }

@@ -29,7 +29,12 @@ enum KeychainPasswordStore {
             var addQuery = query
             addQuery[kSecValueData as String] = data
             addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            SecItemAdd(addQuery as CFDictionary, nil)
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            if addStatus != errSecSuccess {
+                NSLog("[narrowcast] keychain SET add failed for %@: status=%d", account, Int(addStatus))
+            }
+        } else if updateStatus != errSecSuccess {
+            NSLog("[narrowcast] keychain SET update failed for %@: status=%d", account, Int(updateStatus))
         }
     }
 
@@ -43,8 +48,13 @@ enum KeychainPasswordStore {
         ]
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        guard status == errSecSuccess, let data = result as? Data else {
+            NSLog("[narrowcast] keychain GET miss for %@: status=%d", id.uuidString, Int(status))
+            return nil
+        }
+        let pw = String(data: data, encoding: .utf8)
+        NSLog("[narrowcast] keychain GET ok for %@: %d bytes", id.uuidString, data.count)
+        return pw
     }
 
     static func remove(for id: UUID) {

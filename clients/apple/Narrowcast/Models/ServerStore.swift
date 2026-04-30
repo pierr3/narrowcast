@@ -19,7 +19,10 @@ final class ServerStore: ObservableObject {
     func add(_ s: Server, password: String?) {
         servers.append(s)
         if let password, !password.isEmpty {
+            NSLog("[narrowcast] ServerStore.add storing password (%d chars) for server %@", password.count, s.id.uuidString)
             KeychainPasswordStore.set(password, for: s.id)
+        } else {
+            NSLog("[narrowcast] ServerStore.add NO password for server %@ (requiresPassword=%@)", s.id.uuidString, "\(s.requiresPassword)")
         }
         save()
     }

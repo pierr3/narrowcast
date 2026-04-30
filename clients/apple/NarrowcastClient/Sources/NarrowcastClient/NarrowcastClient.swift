@@ -111,18 +111,6 @@ public actor NarrowcastClient {
         self.welcomeWaiter = welcome
         try await transport.send(ClientMessage.hello().encode())
 
-        // Keepalive: re-send Hello every 15 s. Server treats repeat Hello
-        // as a no-op (replies Welcome). The bidirectional traffic resets
-        // QUIC's idle timer on both sides so an idle listener doesn't get
-        // dropped after 30-120 s of no audio.
-        keepaliveTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
-                guard let self else { return }
-                try? await self.transport.send(ClientMessage.hello().encode())
-            }
-        }
-
         // Background re-sender; cancels if Welcome arrives.
         let retry = Task { [weak self] in
             for _ in 0..<3 {
@@ -138,10 +126,26 @@ public actor NarrowcastClient {
         do {
             let info = try await welcome.value
             retry.cancel()
+            // Keepalive starts only after Welcome lands. Doing this earlier
+            // could fire a Hello while Apple QUIC was still in handshake
+            // settle; Apple's stack occasionally rejects rapid
+            // post-handshake sends with EINVAL on the simulator.
+            startKeepalive()
             return info
         } catch {
             retry.cancel()
             throw error
+        }
+    }
+
+    private func startKeepalive() {
+        keepaliveTask?.cancel()
+        keepaliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self else { return }
+                try? await self.transport.send(ClientMessage.hello().encode())
+            }
         }
     }
 

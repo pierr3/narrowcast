@@ -58,7 +58,7 @@ release: bump-build upload-testflight
 build: project
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) \
 		-destination 'generic/platform=iOS Simulator' \
-		-configuration Debug build CODE_SIGNING_ALLOWED=NO
+		-configuration Debug build
 
 archive: project
 	rm -rf $(ARCHIVE_PATH)

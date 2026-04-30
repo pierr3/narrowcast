@@ -96,13 +96,21 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Apple Distribution"
+        # Keychain access requires the keychain-access-groups entitlement.
+        # Without it SecItemCopyMatching returns errSecMissingEntitlement
+        # (-34018) even on the Simulator.
+        CODE_SIGN_ENTITLEMENTS: Narrowcast/Resources/Narrowcast.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       configs:
         Debug:
-          # No Apple Development cert on this Mac, so Debug builds skip
-          # signing entirely. Sim works without it. To run Debug on a
-          # tethered device later, create a Development cert (same CSR
-          # flow as the Distribution one) and remove this block.
-          CODE_SIGNING_ALLOWED: "NO"
-          CODE_SIGN_IDENTITY: ""
-          PROVISIONING_PROFILE_SPECIFIER: ""
+          # Sim Debug needs ad-hoc signing ("-" identity) so the
+          # entitlements file actually gets embedded in the .app — without
+          # signing, Keychain APIs return errSecMissingEntitlement (-34018).
+          # iOS-device Debug is left disabled (no Apple Development cert
+          # on this Mac); Release uses the manual Distribution cert.
+          "CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]": "YES"
+          "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]": "-"
+          "PROVISIONING_PROFILE_SPECIFIER[sdk=iphonesimulator*]": ""
+          "CODE_SIGNING_ALLOWED[sdk=iphoneos*]": "NO"
+          "CODE_SIGN_IDENTITY[sdk=iphoneos*]": ""
+          "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]": ""
