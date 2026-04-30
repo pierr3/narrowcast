@@ -74,6 +74,16 @@ final class ConnectionViewModel: ObservableObject {
 
         state = .connecting(stage: "Connecting…")
 
+        // Tear down any stale client from a previous failed attempt — Apple
+        // QUIC accumulates internal NWConnectionGroup state per attempt and
+        // hits POSIX 12 (Cannot allocate memory) after a few stacked
+        // failures. Closing the prior client before dialing again releases
+        // the buffers.
+        if let stale = self.client {
+            self.client = nil
+            Task { await stale.close() }
+        }
+
         let mode: QUICTransport.Mode = server.allowSelfSigned ? .acceptUnverified : .verifyDefault
         let cfg = NarrowcastClient.Config(
             host: server.host,
@@ -109,9 +119,21 @@ final class ConnectionViewModel: ObservableObject {
                 guard let holder else { return }
                 await self?.runEventPump(client: client, holder: holder)
             } catch NarrowcastClient.ConnectError.authFailed {
-                await MainActor.run { self?.state = .authFailed }
+                // Close transport on auth fail too — keeps Apple's QUIC
+                // group state from leaking into the next attempt.
+                await client.close()
+                await MainActor.run {
+                    if self?.client === client { self?.client = nil }
+                    self?.connectedServerId = nil
+                    self?.state = .authFailed
+                }
             } catch {
-                await MainActor.run { self?.state = .error(String(describing: error)) }
+                await client.close()
+                await MainActor.run {
+                    if self?.client === client { self?.client = nil }
+                    self?.connectedServerId = nil
+                    self?.state = .error(String(describing: error))
+                }
             }
         }
     }
