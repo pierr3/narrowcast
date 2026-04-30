@@ -50,13 +50,31 @@ public actor QUICTransport {
 
     public func connect() async throws {
         let quicOpts = NWProtocolQUIC.Options(alpn: [alpn])
-        // Two flags are needed for RFC 9221 datagrams over Network.framework
-        // QUIC. Without `isDatagram = true` the connection establishes but
-        // group.send transmits no datagram frames — the server sees nothing.
-        // (Reference: alta/swift-quic-datagram-example.) 1220 bytes is safely
-        // under typical UDP MTU and what most QUIC stacks negotiate by default.
+
+        // RFC 9221 datagrams. isDatagram + maxDatagramFrameSize > 0 are both
+        // needed; without either, group.send sends nothing on the wire.
+        // (Reference: alta/swift-quic-datagram-example, Apple Forums 685976.)
+        // 1220 B is safely under typical UDP MTU and what most QUIC stacks
+        // negotiate by default; usableDatagramFrameSize from the post-handshake
+        // metadata exposes the actual negotiated size.
         quicOpts.isDatagram = true
         quicOpts.maxDatagramFrameSize = 1220
+
+        // Streams: even datagram-only NWConnectionGroups silently open one
+        // bidirectional stream during handshake (RFC 9000 forces lower stream
+        // IDs to open when higher ones are used). Setting these limits is
+        // belt-and-braces — Apple's defaults work for our quic-go server but
+        // explicit values protect against future server config changes.
+        // (Reference: Apple Forums 744892, 739169 — hidden-stream behaviour.)
+        quicOpts.direction = .bidirectional
+        quicOpts.initialMaxStreamsBidirectional = 4
+        quicOpts.initialMaxStreamsUnidirectional = 4
+
+        // Connection-level flow-control window. 1 MiB is generous for the
+        // datagram-only path (datagrams don't consume this) and stops
+        // server-side flow control from starving us.
+        quicOpts.initialMaxData = 1_048_576
+
         // 120 s idle. Keepalive pings (re-sent Hello every 15 s, see
         // NarrowcastClient) keep the link warm well within this window;
         // the 4× margin tolerates a brief mobile dead-zone or a sleeping
@@ -91,6 +109,14 @@ public actor QUICTransport {
                 guard let self else { return }
                 switch state {
                 case .ready:
+                    // Diagnostic: read the negotiated path MTU. quic-go
+                    // typically settles around 1200; iCloud Private Relay
+                    // can knock this lower. Logged once per connection.
+                    if let meta = group.metadata(definition: NWProtocolQUIC.definition) as? NWProtocolQUIC.Metadata {
+                        NSLog("[narrowcast] QUIC ready, usableDatagramFrameSize=%d", meta.usableDatagramFrameSize)
+                    } else {
+                        NSLog("[narrowcast] QUIC ready (no metadata)")
+                    }
                     resumeBox.resume(.success(()))
                 case .failed(let err):
                     NSLog("[narrowcast] connection failed: \(err)")
