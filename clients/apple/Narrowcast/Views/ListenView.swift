@@ -10,14 +10,16 @@ struct ListenView: View {
     @State private var showFreqEditor = false
 
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             statusBar
-            Spacer().frame(height: 8)
             freqDisplay
             modePicker
             sMeter
             squelch
-            Spacer()
+            waterfall
+                .frame(height: 220)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            Spacer(minLength: 0)
             playStop
         }
         .padding()
@@ -118,6 +120,18 @@ struct ListenView: View {
                 get: { Double(vm.squelchDb) },
                 set: { vm.setSquelch(Float($0)) }
             ), in: -120...0)
+        }
+    }
+
+    private var waterfall: some View {
+        WaterfallView(frames: vm.waterfallFrames) { frac in
+            // Tap maps to a bin-fraction; convert to freq offset from current
+            // center using the server-reported sample rate.
+            guard let info = vm.serverInfo, vm.freqHz > 0 else { return }
+            let sr = Double(info.sampleRate)
+            let offset = (Double(frac) - 0.5) * sr
+            let newHz = max(info.minHz, min(info.maxHz, UInt64(Int64(vm.freqHz) + Int64(offset))))
+            vm.setFrequency(newHz)
         }
     }
 

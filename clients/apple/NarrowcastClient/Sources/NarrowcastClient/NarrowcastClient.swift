@@ -187,6 +187,16 @@ public actor NarrowcastClient {
             case .seqMark(let a, let f, let s):
                 if let sample = lossTracker.observeSeqMark(audioSent: a, fftSent: f, statusSent: s) {
                     eventsContinuation?.yield(.loss(sample))
+                    // Echo the loss measurement back to the server so it can
+                    // adapt FFT rate + Opus bitrate. Best-effort; failure to
+                    // send is harmless — server falls back to full quality
+                    // when no reports arrive.
+                    let report = ClientMessage.qualityReport(
+                        audioLossPct: sample.audioLossPct,
+                        fftLossPct: sample.fftLossPct,
+                        windowMs: sample.windowMs
+                    )
+                    try? await transport.send(report.encode())
                 }
 
             case .unknown(let t):

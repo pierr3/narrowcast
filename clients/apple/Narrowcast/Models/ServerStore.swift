@@ -1,24 +1,25 @@
 import Foundation
 import SwiftUI
 
-// Server list + passwords persisted in UserDefaults. Passwords in
-// UserDefaults is insecure — Keychain replaces this in Phase 10. Until then
-// this is the cheapest way to keep dev rebuilds usable across launches.
+// Server list in UserDefaults; per-server passwords in Keychain.
+// On first launch after the Keychain switch, any cleartext password left
+// behind by the older UserDefaults stub is migrated and the old key wiped.
 @MainActor
 final class ServerStore: ObservableObject {
     @Published var servers: [Server] = []
 
     private let serversKey = "narrowcast.servers.v1"
-    private let passwordsKey = "narrowcast.passwords.v1"
+    private let legacyPasswordsKey = "narrowcast.passwords.v1"
 
     init() {
         load()
+        migrateLegacyPasswordsIfPresent()
     }
 
     func add(_ s: Server, password: String?) {
         servers.append(s)
         if let password, !password.isEmpty {
-            setPassword(password, for: s.id)
+            KeychainPasswordStore.set(password, for: s.id)
         }
         save()
     }
@@ -28,37 +29,19 @@ final class ServerStore: ObservableObject {
             servers[i] = s
         }
         if let password, !password.isEmpty {
-            setPassword(password, for: s.id)
+            KeychainPasswordStore.set(password, for: s.id)
         }
         save()
     }
 
     func remove(_ s: Server) {
         servers.removeAll { $0.id == s.id }
-        var map = loadPasswords()
-        map.removeValue(forKey: s.id.uuidString)
-        savePasswords(map)
+        KeychainPasswordStore.remove(for: s.id)
         save()
     }
 
     func password(for id: UUID) -> String? {
-        let map = loadPasswords()
-        let pw = map[id.uuidString]
-        return (pw?.isEmpty ?? true) ? nil : pw
-    }
-
-    private func setPassword(_ pw: String, for id: UUID) {
-        var map = loadPasswords()
-        map[id.uuidString] = pw
-        savePasswords(map)
-    }
-
-    private func loadPasswords() -> [String: String] {
-        (UserDefaults.standard.dictionary(forKey: passwordsKey) as? [String: String]) ?? [:]
-    }
-
-    private func savePasswords(_ map: [String: String]) {
-        UserDefaults.standard.set(map, forKey: passwordsKey)
+        KeychainPasswordStore.get(for: id)
     }
 
     private func save() {
@@ -71,5 +54,17 @@ final class ServerStore: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: serversKey),
               let decoded = try? JSONDecoder().decode([Server].self, from: data) else { return }
         servers = decoded
+    }
+
+    private func migrateLegacyPasswordsIfPresent() {
+        guard let legacy = UserDefaults.standard.dictionary(forKey: legacyPasswordsKey) as? [String: String] else {
+            return
+        }
+        for (idStr, pw) in legacy where !pw.isEmpty {
+            if let uuid = UUID(uuidString: idStr) {
+                KeychainPasswordStore.set(pw, for: uuid)
+            }
+        }
+        UserDefaults.standard.removeObject(forKey: legacyPasswordsKey)
     }
 }

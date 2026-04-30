@@ -31,6 +31,8 @@ final class ConnectionViewModel: ObservableObject {
     @Published var lastLoss: LossTracker.Sample?
     @Published var audioPacketsReceived: Int = 0
     @Published var fftFrameLatest: [UInt8] = []
+    @Published var waterfallFrames: [[UInt8]] = []   // newest at index 0
+    private let waterfallDepth = 120
 
     private var client: NarrowcastClient?
     private var pump: Task<Void, Never>?
@@ -183,6 +185,10 @@ final class ConnectionViewModel: ObservableObject {
             lastOpusPacket = opus
         case .fft(let bins):
             fftFrameLatest = bins
+            waterfallFrames.insert(bins, at: 0)
+            if waterfallFrames.count > waterfallDepth {
+                waterfallFrames.removeLast(waterfallFrames.count - waterfallDepth)
+            }
         case .status(let s, let q, let m, let f, let cc):
             sMeterDb = s
             squelchDb = q
