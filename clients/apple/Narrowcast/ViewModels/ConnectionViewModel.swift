@@ -145,6 +145,29 @@ final class ConnectionViewModel: ObservableObject {
         }
     }
 
+    /// Apply a Favorite by sending the four commands the preset captures.
+    /// Mode goes first so the demod chain is rebuilt before frequency lands.
+    func applyFavorite(_ f: Favorite) {
+        setMode(f.mode)
+        setFrequency(f.freqHz)
+        setSquelch(f.squelchDb)
+        autoGain = f.gainAuto
+        manualGainDb = f.gainDb
+        Task { try? await client?.send(.setGain(dB: f.gainAuto ? 0 : f.gainDb)) }
+    }
+
+    /// Build a Favorite snapshot from the current UI/state.
+    func currentSnapshotForFavorite(name: String) -> Favorite {
+        Favorite(
+            name: name,
+            freqHz: freqHz,
+            mode: mode,
+            squelchDb: squelchDb,
+            gainAuto: autoGain,
+            gainDb: manualGainDb
+        )
+    }
+
     private nonisolated func runEventPump(client: NarrowcastClient,
                                           holder: AudioPipelineHolder) async {
         // Loop runs on a background context (not @MainActor). Audio takes

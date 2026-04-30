@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "NarrowcastClient",
-    platforms: [.iOS(.v18), .macOS(.v15)],
+    platforms: [.iOS("26.0"), .macOS("26.0")],
     products: [
         .library(name: "NarrowcastClient", targets: ["NarrowcastClient"]),
     ],
