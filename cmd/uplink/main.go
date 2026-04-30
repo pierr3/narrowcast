@@ -52,6 +52,16 @@ func main() {
 func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
+		// quic-go's default idle timeout is 30 s. The uplink↔relay link sits
+		// idle whenever no client is streaming, so without a keepalive the
+		// connection drops every 30 s and reconnects. That window is exactly
+		// when a fresh client's Hello can land at the relay and find
+		// r.upstream == nil — the Hello is dropped, the Pi never sees it,
+		// the client times out waiting for Welcome. Send a PING every 15 s
+		// to suppress idle timeout. Also bump MaxIdleTimeout so a brief
+		// network blip doesn't tear the link down before the next ping.
+		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:  60 * time.Second,
 	}
 
 	// Local connection: self-signed Pi cert, skip verification
