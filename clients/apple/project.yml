@@ -51,14 +51,31 @@ targets:
         # Connecting to the relay over a public domain doesn't need this,
         # but the toggle lets users add a direct-Pi server entry.
         NSLocalNetworkUsageDescription: Narrowcast connects to a Pi on your local network when you save a server with a private address.
+    # Signing.local.xcconfig (gitignored) provides DEVELOPMENT_TEAM and
+    # PROVISIONING_PROFILE_SPECIFIER so the team ID + profile name never
+    # land in version control. Copy Signing.example.xcconfig before first
+    # build. xcconfig values override the base settings below.
+    configFiles:
+      Debug: Signing.local.xcconfig
+      Release: Signing.local.xcconfig
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.pierr3.narrowcast
-        MARKETING_VERSION: "0.1.0"
+        MARKETING_VERSION: "2.0"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.9"
         ENABLE_PREVIEWS: YES
-        CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_ASSET_PATHS: ""
         GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+      configs:
+        Debug:
+          # No Apple Development cert on this Mac, so Debug builds skip
+          # signing entirely. Sim works without it. To run Debug on a
+          # tethered device later, create a Development cert (same CSR
+          # flow as the Distribution one) and remove this block.
+          CODE_SIGNING_ALLOWED: "NO"
+          CODE_SIGN_IDENTITY: ""
+          PROVISIONING_PROFILE_SPECIFIER: ""

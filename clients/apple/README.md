@@ -54,7 +54,12 @@ One-time setup before `make upload-testflight`:
    mv ~/Downloads/AuthKey_<KEYID>.p8 ~/.appstoreconnect/private_keys/
    chmod 600 ~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8
    ```
-5. Edit `ExportOptions.plist` — replace `REPLACE_WITH_TEAM_ID` and `REPLACE_WITH_PROFILE_NAME`.
+5. Copy and fill in the two gitignored signing files:
+   ```bash
+   cp Signing.example.xcconfig Signing.local.xcconfig
+   cp ExportOptions.example.plist ExportOptions.local.plist
+   ```
+   Edit both — `Signing.local.xcconfig` holds the Team ID + profile name (xcconfig drives the project), `ExportOptions.local.plist` holds the same values for `xcodebuild -exportArchive`. Both are gitignored so the values stay local.
 6. Export the API key IDs in your shell:
    ```bash
    export ASC_KEY_ID=<your-key-id>

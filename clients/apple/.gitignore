@@ -27,3 +27,8 @@ build/
 *.p12
 *.cer
 *.mobileprovision
+
+## Per-developer signing config (Team ID + profile name). The .example
+## variants are committed as templates; copy → fill in → use.
+Signing.local.xcconfig
+ExportOptions.local.plist

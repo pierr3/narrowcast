@@ -1,0 +1,11 @@
+// Copy this file to Signing.local.xcconfig and fill in your values.
+// Signing.local.xcconfig is gitignored so the real Team ID + profile name
+// stay out of version control. The xcodegen project pulls it in via
+// configFiles in project.yml.
+
+// 10-character Team ID from developer.apple.com → Membership.
+DEVELOPMENT_TEAM = REPLACE_WITH_TEAM_ID
+
+// Exact display name of the App Store distribution provisioning profile,
+// as listed at developer.apple.com → Profiles.
+PROVISIONING_PROFILE_SPECIFIER = REPLACE_WITH_PROFILE_NAME

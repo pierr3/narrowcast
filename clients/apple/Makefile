@@ -23,7 +23,7 @@ CONFIG       := Release
 ARCHIVE_PATH := build/Narrowcast.xcarchive
 EXPORT_PATH  := build/export
 IPA_PATH     := $(EXPORT_PATH)/Narrowcast.ipa
-EXPORT_OPTS  := ExportOptions.plist
+EXPORT_OPTS  := ExportOptions.local.plist
 
 ASC_KEY_ID    ?= $(shell echo $${ASC_KEY_ID})
 ASC_ISSUER_ID ?= $(shell echo $${ASC_ISSUER_ID})
