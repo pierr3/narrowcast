@@ -34,6 +34,12 @@ targets:
       path: Narrowcast/Resources/Info.plist
       properties:
         CFBundleDisplayName: Narrowcast
+        # GENERATE_INFOPLIST_FILE is NO so Xcode doesn't auto-inject these.
+        # Pull from build settings via the $() reference syntax so the
+        # values stay sourced from MARKETING_VERSION + CURRENT_PROJECT_VERSION
+        # in this file (and `make bump-build` keeps working).
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen:
           UIColorName: ""
         UIBackgroundModes:
