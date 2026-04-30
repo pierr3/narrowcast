@@ -32,3 +32,7 @@ build/
 ## variants are committed as templates; copy → fill in → use.
 Signing.local.xcconfig
 ExportOptions.local.plist
+
+## App Store Connect API key IDs (auto-loaded by Makefile). The .p8 itself
+## lives in ~/.appstoreconnect/private_keys/.
+.env

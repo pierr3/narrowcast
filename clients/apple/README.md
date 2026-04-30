@@ -60,11 +60,12 @@ One-time setup before `make upload-testflight`:
    cp ExportOptions.example.plist ExportOptions.local.plist
    ```
    Edit both — `Signing.local.xcconfig` holds the Team ID + profile name (xcconfig drives the project), `ExportOptions.local.plist` holds the same values for `xcodebuild -exportArchive`. Both are gitignored so the values stay local.
-6. Export the API key IDs in your shell:
+6. Drop the API key IDs in `.env`:
    ```bash
-   export ASC_KEY_ID=<your-key-id>
-   export ASC_ISSUER_ID=<your-issuer-id>
+   cp .env.example .env
+   # edit .env: ASC_KEY_ID + ASC_ISSUER_ID
    ```
+   `.env` is gitignored. The Makefile auto-loads it.
 
 After setup: `make upload-testflight`.
 

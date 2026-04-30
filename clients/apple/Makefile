@@ -17,6 +17,13 @@
 #   make export          — sign + package archive into .ipa
 #   make upload-testflight — push .ipa to App Store Connect / TestFlight
 
+# Auto-load .env if present (gitignored). Holds ASC_KEY_ID + ASC_ISSUER_ID.
+# Use -include (with leading dash) so a missing file doesn't fatal — devs
+# can still run `make build` etc. without TestFlight credentials.
+-include .env
+export ASC_KEY_ID
+export ASC_ISSUER_ID
+
 PROJECT      := Narrowcast.xcodeproj
 SCHEME       := Narrowcast
 CONFIG       := Release
