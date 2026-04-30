@@ -32,15 +32,24 @@ public actor NarrowcastClient {
     public enum ConnectError: Error, CustomStringConvertible {
         case authFailed
         case authTimeout
-        case welcomeTimeout
+        /// Welcome never arrived. `viaRelay` true → we authenticated with
+        /// the relay so it's up; the SDR uplink behind it isn't responding.
+        /// `viaRelay` false → direct-Pi mode and the Pi never replied.
+        case welcomeTimeout(viaRelay: Bool)
         case transport(Error)
 
         public var description: String {
             switch self {
-            case .authFailed:    return "Authentication failed"
-            case .authTimeout:   return "Auth timed out — relay didn't reply"
-            case .welcomeTimeout: return "Welcome timed out — server didn't reply"
-            case .transport(let e): return "Transport: \(e)"
+            case .authFailed:
+                return "Authentication failed"
+            case .authTimeout:
+                return "Auth timed out — relay didn't reply"
+            case .welcomeTimeout(let viaRelay):
+                return viaRelay
+                    ? "Relay reached, but the radio isn't responding"
+                    : "Radio didn't reply"
+            case .transport(let e):
+                return "Transport: \(e)"
             }
         }
     }
@@ -102,18 +111,30 @@ public actor NarrowcastClient {
             await self?.runPump()
         }
 
+        let viaRelay = (password != nil)
+
         if let password {
+            onStage("Authenticating with relay…")
             let waiter = OneShot<Void>(timeout: 5.0, onTimeout: ConnectError.authTimeout)
             self.authWaiter = waiter
             try await transport.send(ClientMessage.auth(passwordHash: PasswordHash.sha256(password)).encode())
             try await waiter.value
+            // AuthOK in hand → relay is up. The next step is reaching the
+            // SDR uplink behind it; calling that out helps the user tell
+            // "relay is fine but my radio's offline" from "relay is dead".
+            onStage("Relay connected. Reaching radio…")
+        } else {
+            onStage("Reaching radio…")
         }
 
         // Welcome is fanned out from the Pi via the relay; if the Pi was
         // bouncing or the first Hello was dropped before our client was in
         // the relay's fan-out map, we'd hang. Retry Hello a few times
         // before giving up — the Pi sends Welcome on every Hello received.
-        let welcome = OneShot<ServerInfo>(timeout: 8.0, onTimeout: ConnectError.welcomeTimeout)
+        let welcome = OneShot<ServerInfo>(
+            timeout: 8.0,
+            onTimeout: ConnectError.welcomeTimeout(viaRelay: viaRelay)
+        )
         self.welcomeWaiter = welcome
         try await transport.send(ClientMessage.hello().encode())
 
