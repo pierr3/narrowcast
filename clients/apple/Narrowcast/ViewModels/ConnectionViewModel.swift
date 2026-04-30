@@ -37,6 +37,15 @@ final class ConnectionViewModel: ObservableObject {
 
     func connect(server: Server, password: String?) {
         guard state != .connecting && state != .connected else { return }
+
+        // Relay always demands auth as the first datagram; sending Hello
+        // first triggers an immediate close and looks like a network glitch
+        // ("Network is down" / EINVAL) instead of an obvious misconfig.
+        if server.requiresPassword && (password?.isEmpty ?? true) {
+            state = .error("Password required for this server")
+            return
+        }
+
         state = .connecting
 
         let mode: QUICTransport.Mode = server.allowSelfSigned ? .acceptUnverified : .verifyDefault
