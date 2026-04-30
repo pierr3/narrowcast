@@ -34,7 +34,7 @@ struct ListenView: View {
                 } label: {
                     Image(systemName: "xmark.circle")
                 }
-                .disabled(vm.state != .connected && vm.state != .connecting)
+                .disabled({ if case .connected = vm.state { return false }; if case .connecting = vm.state { return false }; return true }())
             }
         }
         .onAppear {
@@ -76,7 +76,7 @@ struct ListenView: View {
     private var stateLabel: String {
         switch vm.state {
         case .idle: return "Idle"
-        case .connecting: return "Connecting…"
+        case .connecting(let stage): return stage
         case .connected: return "Connected"
         case .authFailed: return "Auth failed"
         case .error(let msg): return msg

@@ -13,7 +13,7 @@ final class ConnectionViewModel: ObservableObject {
 
     enum State: Equatable {
         case idle
-        case connecting
+        case connecting(stage: String)
         case connected
         case authFailed
         case error(String)
@@ -52,14 +52,16 @@ final class ConnectionViewModel: ObservableObject {
 
     func connect(server: Server, password: String?) {
         // Already on this server: re-entry from navigation, no-op.
-        if connectedServerId == server.id, state == .connected || state == .connecting {
-            return
+        if connectedServerId == server.id {
+            if state == .connected { return }
+            if case .connecting = state { return }
         }
         // Switching servers: tear down the old connection first.
         if connectedServerId != nil, connectedServerId != server.id {
             disconnect()
         }
-        guard state != .connecting && state != .connected else { return }
+        if case .connecting = state { return }
+        if state == .connected { return }
         connectedServerId = server.id
 
         // Relay always demands auth as the first datagram. Without a password
@@ -70,7 +72,7 @@ final class ConnectionViewModel: ObservableObject {
             return
         }
 
-        state = .connecting
+        state = .connecting(stage: "Connecting…")
 
         let mode: QUICTransport.Mode = server.allowSelfSigned ? .acceptUnverified : .verifyDefault
         let cfg = NarrowcastClient.Config(
@@ -84,7 +86,13 @@ final class ConnectionViewModel: ObservableObject {
 
         Task { [weak self] in
             do {
-                let info = try await client.connect()
+                let info = try await client.connect { stage in
+                    Task { @MainActor in
+                        if case .connecting = self?.state {
+                            self?.state = .connecting(stage: stage)
+                        }
+                    }
+                }
                 await MainActor.run {
                     self?.serverInfo = info
                     self?.state = .connected

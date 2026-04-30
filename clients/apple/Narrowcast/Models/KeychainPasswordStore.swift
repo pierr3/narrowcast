@@ -19,6 +19,7 @@ enum KeychainPasswordStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
         ]
 
         // SecItemUpdate fails if the item doesn't exist; SecItemAdd fails if
@@ -28,7 +29,12 @@ enum KeychainPasswordStore {
         if updateStatus == errSecItemNotFound {
             var addQuery = query
             addQuery[kSecValueData as String] = data
-            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            // Synchronizable + accessible-when-unlocked (no ThisDeviceOnly)
+            // makes the entry ride iCloud Keychain across the user's
+            // signed-in devices. Server list + favourites already sync via
+            // KVS; this completes the picture.
+            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+            addQuery[kSecAttrSynchronizable as String] = kCFBooleanTrue
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             if addStatus != errSecSuccess {
                 NSLog("[narrowcast] keychain SET add failed for %@: status=%d", account, Int(addStatus))
@@ -39,10 +45,14 @@ enum KeychainPasswordStore {
     }
 
     static func get(for id: UUID) -> String? {
+        // kSecAttrSynchronizableAny matches both local-only and synced
+        // entries — needed because some devices may have entries pushed
+        // from iCloud Keychain while others wrote local-only first.
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: id.uuidString,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
         ]
@@ -62,6 +72,7 @@ enum KeychainPasswordStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: id.uuidString,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
         ]
         SecItemDelete(query as CFDictionary)
     }

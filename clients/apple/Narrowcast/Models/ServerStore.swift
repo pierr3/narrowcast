@@ -1,19 +1,28 @@
 import Foundation
 import SwiftUI
 
-// Server list in UserDefaults; per-server passwords in Keychain.
-// On first launch after the Keychain switch, any cleartext password left
-// behind by the older UserDefaults stub is migrated and the old key wiped.
+// Server list synced via NSUbiquitousKeyValueStore. Per-server passwords
+// live in Keychain with kSecAttrSynchronizable so they ride iCloud
+// Keychain across devices.
 @MainActor
 final class ServerStore: ObservableObject {
     @Published var servers: [Server] = []
 
     private let serversKey = "narrowcast.servers.v1"
     private let legacyPasswordsKey = "narrowcast.passwords.v1"
+    private var observer: NSObjectProtocol?
 
     init() {
         load()
         migrateLegacyPasswordsIfPresent()
+        migrateLegacyServersIfPresent()
+        observer = iCloudKVStore.observeRemoteChanges { [weak self] in
+            self?.load()
+        }
+    }
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 
     func add(_ s: Server, password: String?) {
@@ -21,8 +30,6 @@ final class ServerStore: ObservableObject {
         if let password, !password.isEmpty {
             NSLog("[narrowcast] ServerStore.add storing password (%d chars) for server %@", password.count, s.id.uuidString)
             KeychainPasswordStore.set(password, for: s.id)
-        } else {
-            NSLog("[narrowcast] ServerStore.add NO password for server %@ (requiresPassword=%@)", s.id.uuidString, "\(s.requiresPassword)")
         }
         save()
     }
@@ -49,14 +56,26 @@ final class ServerStore: ObservableObject {
 
     private func save() {
         if let data = try? JSONEncoder().encode(servers) {
-            UserDefaults.standard.set(data, forKey: serversKey)
+            iCloudKVStore.setData(data, forKey: serversKey)
         }
     }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: serversKey),
+        guard let data = iCloudKVStore.data(forKey: serversKey),
               let decoded = try? JSONDecoder().decode([Server].self, from: data) else { return }
         servers = decoded
+    }
+
+    /// Pull anything left over from the pre-iCloud UserDefaults store into
+    /// KVS the first time we run with sync enabled. Wipes the legacy key.
+    private func migrateLegacyServersIfPresent() {
+        guard let legacy = UserDefaults.standard.data(forKey: serversKey),
+              let decoded = try? JSONDecoder().decode([Server].self, from: legacy) else { return }
+        if servers.isEmpty {
+            servers = decoded
+            save()
+        }
+        UserDefaults.standard.removeObject(forKey: serversKey)
     }
 
     private func migrateLegacyPasswordsIfPresent() {

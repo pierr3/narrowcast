@@ -79,11 +79,17 @@ public actor NarrowcastClient {
         self.eventsContinuation = cont
     }
 
+    /// Stages the UI surfaces while connect() progresses. Caller passes a
+    /// closure that updates a label like "Reaching server…" → "Authenticating…"
+    /// so the loading state isn't an opaque "Connecting…" for 8 seconds.
+    public typealias StageCallback = @Sendable (String) -> Void
+
     /// Connect, authenticate (if password set), send Hello, wait for Welcome.
     /// Starts the inbound pump immediately after the transport is ready so
     /// auth/welcome replies are observed via one-shot waiters routed by the
     /// pump (AsyncStream supports only one iterator).
-    public func connect() async throws -> ServerInfo {
+    public func connect(onStage: StageCallback = { _ in }) async throws -> ServerInfo {
+        onStage("Reaching server…")
         do {
             try await transport.connect()
         } catch {
