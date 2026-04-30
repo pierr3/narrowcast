@@ -576,7 +576,10 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 
 	// Status state (send ~4 times per second)
 	lastStatus := time.Now()
-	statusInterval := 250 * time.Millisecond
+	// 10 Hz status — fast enough that the S-meter feels responsive on the
+	// client without dominating the bandwidth budget. Status payload is
+	// ~18-19 B (with relay's client-count append), so 10 Hz = ~190 B/s.
+	statusInterval := 100 * time.Millisecond
 	var signalPowerDb float32 = -120
 
 	for {

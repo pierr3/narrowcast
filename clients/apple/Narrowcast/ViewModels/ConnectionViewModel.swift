@@ -40,7 +40,10 @@ final class ConnectionViewModel: ObservableObject {
 
     private var client: NarrowcastClient?
     private var pump: Task<Void, Never>?
-    private var pipeline: AudioPipeline?
+    // Stable handle the pump captures once. Pipeline mutations (e.g. mode
+    // change rebuilding the decoder for a new sample rate) update the
+    // contents without invalidating the pump's reference.
+    private let pipelineHolder = AudioPipelineHolder()
 
     func connect(server: Server, password: String?) {
         guard state != .connecting && state != .connected else { return }
@@ -73,8 +76,9 @@ final class ConnectionViewModel: ObservableObject {
                     self?.state = .connected
                     self?.bootAudio(sampleRate: 16000)
                 }
-                let pipe = await MainActor.run { self?.pipeline }
-                await self?.runEventPump(client: client, pipeline: pipe)
+                let holder = await MainActor.run { self?.pipelineHolder }
+                guard let holder else { return }
+                await self?.runEventPump(client: client, holder: holder)
             } catch NarrowcastClient.ConnectError.authFailed {
                 await MainActor.run { self?.state = .authFailed }
             } catch {
@@ -86,8 +90,7 @@ final class ConnectionViewModel: ObservableObject {
     func disconnect() {
         pump?.cancel()
         pump = nil
-        pipeline?.stop()
-        pipeline = nil
+        pipelineHolder.stop()
         let c = client
         client = nil
         Task {
@@ -143,14 +146,14 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     private nonisolated func runEventPump(client: NarrowcastClient,
-                                          pipeline: AudioPipeline?) async {
+                                          holder: AudioPipelineHolder) async {
         // Loop runs on a background context (not @MainActor). Audio takes
         // the hot path straight to the AudioPipeline queue with no actor
         // hop. UI events bounce to MainActor only when state changes.
         for await event in await client.events {
             switch event {
             case .audio(let opus):
-                pipeline?.feed(opus)
+                holder.feed(opus)
 
             case .fft(let bins):
                 let wantWaterfall = await MainActor.run { self.waterfallEnabled }
@@ -182,8 +185,7 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     private func bootAudio(sampleRate: Int) {
-        pipeline?.stop()
-        pipeline = try? AudioPipeline(sampleRate: sampleRate)
+        pipelineHolder.set(try? AudioPipeline(sampleRate: sampleRate))
     }
 
     private func handle(_ event: NarrowcastClient.Event) {
@@ -201,8 +203,7 @@ final class ConnectionViewModel: ObservableObject {
                 let needRate = sampleRate(for: m)
                 let prevRate = sampleRate(for: prev)
                 if needRate != prevRate {
-                    pipeline?.stop()
-                    pipeline = try? AudioPipeline(sampleRate: needRate)
+                    pipelineHolder.set(try? AudioPipeline(sampleRate: needRate))
                 }
             }
             // Older Pi builds emit status without a freq field, decoded as 0.

@@ -29,7 +29,7 @@ public final class AudioPlayer: @unchecked Sendable {
     private let startedFlag = OSAllocatedUnfairLock(initialState: false)
     private let pendingStart: () -> Void
 
-    public init(sampleRate: Int, prerollMs: Int = 60) throws {
+    public init(sampleRate: Int, prerollMs: Int = 150) throws {
         self.sampleRate = Double(sampleRate)
         self.prerollSamples = sampleRate * prerollMs / 1000
         self.ring = PCMRing(capacity: sampleRate)  // 1 s headroom
