@@ -4,10 +4,10 @@ import SwiftUI
 import NarrowcastProtocol
 import NarrowcastClient
 
-// ConnectionViewModel owns a NarrowcastClient and fans out the inbound
-// AsyncStream of Events into @Published properties the SwiftUI views bind to.
-// Audio playback hook is a stub (Phase 4) — incoming Opus packets are
-// counted, not yet decoded.
+// ConnectionViewModel owns a NarrowcastClient and fans the inbound event
+// stream into @Published properties. Audio decode runs off-main on
+// AudioPipeline's queue so the SwiftUI runloop isn't pegged at ~50
+// packets/sec; only UI-bound state crosses MainActor.
 @MainActor
 final class ConnectionViewModel: ObservableObject {
 
@@ -29,25 +29,25 @@ final class ConnectionViewModel: ObservableObject {
     @Published var clientCount: UInt8 = 0
     @Published var streaming: Bool = false
     @Published var autoGain: Bool = true
-    @Published var manualGainDb: Float = 20  // RTL-SDR R820T sensible default
+    @Published var manualGainDb: Float = 20
     @Published var lastLoss: LossTracker.Sample?
-    @Published var audioPacketsReceived: Int = 0
-    @Published var fftFrameLatest: [UInt8] = []
-    @Published var waterfallFrames: [[UInt8]] = []   // newest at index 0
+
+    // Waterfall data is only published when a consumer asks for it. SwiftUI
+    // would otherwise redraw on every 10 Hz FFT regardless of visibility.
+    @Published var waterfallFrames: [[UInt8]] = []
+    var waterfallEnabled = false
     private let waterfallDepth = 120
 
     private var client: NarrowcastClient?
     private var pump: Task<Void, Never>?
-    private var decoder: OpusDecoder?
-    private var audio: AudioPlayer?
-    private var lastOpusPacket: Data?
+    private var pipeline: AudioPipeline?
 
     func connect(server: Server, password: String?) {
         guard state != .connecting && state != .connected else { return }
 
-        // Relay always demands auth as the first datagram; sending Hello
-        // first triggers an immediate close and looks like a network glitch
-        // ("Network is down" / EINVAL) instead of an obvious misconfig.
+        // Relay always demands auth as the first datagram. Without a password
+        // we'd ship Hello, the relay would close us with "unexpected", and
+        // the failure surfaces as opaque "Network is down" / EINVAL.
         if server.requiresPassword && (password?.isEmpty ?? true) {
             state = .error("Password required for this server")
             return
@@ -85,10 +85,8 @@ final class ConnectionViewModel: ObservableObject {
     func disconnect() {
         pump?.cancel()
         pump = nil
-        audio?.stop()
-        audio = nil
-        decoder = nil
-        lastOpusPacket = nil
+        pipeline?.stop()
+        pipeline = nil
         let c = client
         client = nil
         Task {
@@ -117,7 +115,7 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     func setFrequency(_ hz: UInt64) {
-        freqHz = hz // optimistic; reconciled by next status frame
+        freqHz = hz // optimistic; may be reconciled by a status frame
         Task { try? await client?.send(.setFrequency(hz: hz)) }
     }
 
@@ -145,12 +143,29 @@ final class ConnectionViewModel: ObservableObject {
 
     private func runEventPump(client: NarrowcastClient) async {
         for await event in await client.events {
-            await MainActor.run {
-                self.handle(event)
+            switch event {
+            case .audio(let opus):
+                // Hot path. No MainActor hop, no @Published mutation —
+                // straight into the audio queue.
+                pipeline?.feed(opus)
+
+            case .fft(let bins):
+                guard waterfallEnabled else { continue }
+                await MainActor.run { self.appendFFT(bins) }
+
+            default:
+                await MainActor.run { self.handle(event) }
             }
         }
         await MainActor.run {
             if self.state == .connected { self.state = .disconnected }
+        }
+    }
+
+    private func appendFFT(_ bins: [UInt8]) {
+        waterfallFrames.insert(bins, at: 0)
+        if waterfallFrames.count > waterfallDepth {
+            waterfallFrames.removeLast(waterfallFrames.count - waterfallDepth)
         }
     }
 
@@ -163,64 +178,44 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     private func bootAudio(sampleRate: Int) {
-        // Tear down any prior session on reconnect.
-        audio?.stop()
-        decoder = try? OpusDecoder(sampleRate: sampleRate)
-        audio = try? AudioPlayer(sampleRate: sampleRate)
-        try? audio?.start()
-        lastOpusPacket = nil
-    }
-
-    /// Switch the decoder/player to a new sample rate (mode change WFM↔NFM/AM
-    /// flips between 48 kHz and 16 kHz). Called from a status frame whose
-    /// implied rate differs from the current one. Brief gap during swap is
-    /// preferred to mismatched rates (resampling distortion).
-    private func resetAudio(sampleRate: Int) {
-        audio?.stop()
-        decoder = try? OpusDecoder(sampleRate: sampleRate)
-        audio = try? AudioPlayer(sampleRate: sampleRate)
-        try? audio?.start()
-        lastOpusPacket = nil
+        pipeline?.stop()
+        pipeline = try? AudioPipeline(sampleRate: sampleRate)
     }
 
     private func handle(_ event: NarrowcastClient.Event) {
         switch event {
         case .welcome(let info):
             serverInfo = info
-        case .audio(let opus):
-            audioPacketsReceived &+= 1
-            if let pcm = decoder?.decode(opus) {
-                audio?.enqueue(pcm)
-            }
-            lastOpusPacket = opus
-        case .fft(let bins):
-            fftFrameLatest = bins
-            waterfallFrames.insert(bins, at: 0)
-            if waterfallFrames.count > waterfallDepth {
-                waterfallFrames.removeLast(waterfallFrames.count - waterfallDepth)
-            }
+
         case .status(let s, let q, let m, let f, let cc):
             sMeterDb = s
             squelchDb = q
-            // Mode change flips the audio sample rate (WFM=48k, NFM/AM=16k).
-            // Rebuild the decoder + player when it shifts; brief gap is
-            // preferable to playing 48k samples through a 16k pipeline.
+
             if m != mode {
                 let prev = mode
                 mode = m
                 let needRate = sampleRate(for: m)
                 let prevRate = sampleRate(for: prev)
                 if needRate != prevRate {
-                    resetAudio(sampleRate: needRate)
+                    pipeline?.stop()
+                    pipeline = try? AudioPipeline(sampleRate: needRate)
                 }
             }
-            freqHz = f
+            // Older Pi builds emit status without a freq field, decoded as 0.
+            // Don't let that overwrite the optimistic local value the user
+            // just set via tap-to-tune or the freq sheet.
+            if f != 0 {
+                freqHz = f
+            }
             if let cc { clientCount = cc }
+
         case .loss(let sample):
             lastLoss = sample
-            // Phase 11 will round-trip this back as CmdQualityReport.
-        case .unknown:
+
+        case .audio, .fft, .unknown:
+            // Audio + FFT handled in the pump directly.
             break
+
         case .disconnected:
             state = .disconnected
             streaming = false
