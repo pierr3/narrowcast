@@ -57,7 +57,11 @@ public actor QUICTransport {
         // under typical UDP MTU and what most QUIC stacks negotiate by default.
         quicOpts.isDatagram = true
         quicOpts.maxDatagramFrameSize = 1220
-        quicOpts.idleTimeout = 30_000
+        // 120 s idle. Keepalive pings (re-sent Hello every 15 s, see
+        // NarrowcastClient) keep the link warm well within this window;
+        // the 4× margin tolerates a brief mobile dead-zone or a sleeping
+        // phone before the connection drops.
+        quicOpts.idleTimeout = 120_000
 
         configureSecurity(quicOpts.securityProtocolOptions)
 

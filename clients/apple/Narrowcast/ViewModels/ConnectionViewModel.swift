@@ -76,6 +76,12 @@ final class ConnectionViewModel: ObservableObject {
                     self?.state = .connected
                     self?.bootAudio(sampleRate: 16000)
                 }
+                // Auto-start streaming. The previous "press Play to begin"
+                // UX confused testers — they expected audio on connect and
+                // saw silence + an eventual disconnect when QUIC idle-timed
+                // out before they realised what to tap.
+                try? await client.send(.start)
+                await MainActor.run { self?.streaming = true }
                 let holder = await MainActor.run { self?.pipelineHolder }
                 guard let holder else { return }
                 await self?.runEventPump(client: client, holder: holder)

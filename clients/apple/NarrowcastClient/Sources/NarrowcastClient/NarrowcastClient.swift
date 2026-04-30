@@ -69,6 +69,7 @@ public actor NarrowcastClient {
     private var authWaiter: OneShot<Void>?
     private var welcomeWaiter: OneShot<ServerInfo>?
     private var pumpTask: Task<Void, Never>?
+    private var keepaliveTask: Task<Void, Never>?
 
     public init(config: Config) {
         self.transport = QUICTransport(host: config.host, port: config.port, mode: config.mode)
@@ -110,6 +111,18 @@ public actor NarrowcastClient {
         self.welcomeWaiter = welcome
         try await transport.send(ClientMessage.hello().encode())
 
+        // Keepalive: re-send Hello every 15 s. Server treats repeat Hello
+        // as a no-op (replies Welcome). The bidirectional traffic resets
+        // QUIC's idle timer on both sides so an idle listener doesn't get
+        // dropped after 30-120 s of no audio.
+        keepaliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self else { return }
+                try? await self.transport.send(ClientMessage.hello().encode())
+            }
+        }
+
         // Background re-sender; cancels if Welcome arrives.
         let retry = Task { [weak self] in
             for _ in 0..<3 {
@@ -137,6 +150,8 @@ public actor NarrowcastClient {
     }
 
     public func close() async {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
         pumpTask?.cancel()
         pumpTask = nil
         await transport.close()
