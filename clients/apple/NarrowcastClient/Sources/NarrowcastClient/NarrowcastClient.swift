@@ -102,10 +102,34 @@ public actor NarrowcastClient {
             try await waiter.value
         }
 
-        let welcome = OneShot<ServerInfo>(timeout: 5.0, onTimeout: ConnectError.welcomeTimeout)
+        // Welcome is fanned out from the Pi via the relay; if the Pi was
+        // bouncing or the first Hello was dropped before our client was in
+        // the relay's fan-out map, we'd hang. Retry Hello a few times
+        // before giving up — the Pi sends Welcome on every Hello received.
+        let welcome = OneShot<ServerInfo>(timeout: 8.0, onTimeout: ConnectError.welcomeTimeout)
         self.welcomeWaiter = welcome
         try await transport.send(ClientMessage.hello().encode())
-        return try await welcome.value
+
+        // Background re-sender; cancels if Welcome arrives.
+        let retry = Task { [weak self] in
+            for _ in 0..<3 {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                if await self.welcomeWaiter == nil { return }
+                NSLog("[narrowcast] no welcome — resending Hello")
+                try? await self.transport.send(ClientMessage.hello().encode())
+            }
+        }
+
+        do {
+            let info = try await welcome.value
+            retry.cancel()
+            return info
+        } catch {
+            retry.cancel()
+            throw error
+        }
     }
 
     public func send(_ message: ClientMessage) async throws {
