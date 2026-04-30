@@ -9,9 +9,9 @@
 
 set -euo pipefail
 
-OPUS_VERSION="1.5.2"
+OPUS_VERSION="1.6.1"
 OPUS_TARBALL_URL="https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz"
-SHA256_EXPECTED="65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1"
+SHA256_EXPECTED="6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WORK_DIR="${ROOT_DIR}/.opus-build"
