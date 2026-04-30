@@ -197,6 +197,7 @@ struct FrequencyEditor: View {
     let commit: (UInt64) -> Void
 
     @Environment(\.dismiss) var dismiss
+    @FocusState private var fieldFocused: Bool
     @State private var text: String
 
     init(initial: UInt64, commit: @escaping (UInt64) -> Void) {
@@ -205,15 +206,51 @@ struct FrequencyEditor: View {
         _text = State(initialValue: initial == 0 ? "" : String(format: "%.4f", Double(initial) / 1_000_000))
     }
 
+    private var parsedHz: UInt64? {
+        // Tolerate comma decimal separator (some locale keyboards send ',').
+        let cleaned = text.replacingOccurrences(of: ",", with: ".")
+        guard let mhz = Double(cleaned), mhz > 0 else { return nil }
+        return UInt64(mhz * 1_000_000)
+    }
+
     var body: some View {
         NavigationStack {
-            VStack {
+            VStack(spacing: 20) {
+                Spacer().frame(height: 8)
+
                 TextField("MHz", text: $text)
-                    .font(.system(size: 36, weight: .semibold, design: .rounded))
+                    .font(.system(size: 44, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
                     .multilineTextAlignment(.center)
                     .keyboardType(.decimalPad)
-                    .padding()
+                    .focused($fieldFocused)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 16)
+                    .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 14))
+                    .padding(.horizontal)
+
+                Text(hint)
+                    .font(.caption)
+                    .foregroundStyle(parsedHz == nil && !text.isEmpty ? .red : .secondary)
+
                 Spacer()
+
+                Button {
+                    if let hz = parsedHz {
+                        commit(hz)
+                        dismiss()
+                    }
+                } label: {
+                    Text("Tune")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(parsedHz == nil ? Color.gray : Color.accentColor, in: .rect(cornerRadius: 14))
+                }
+                .disabled(parsedHz == nil)
+                .padding(.horizontal)
+                .padding(.bottom, 12)
             }
             .navigationTitle("Frequency")
             .navigationBarTitleDisplayMode(.inline)
@@ -221,15 +258,14 @@ struct FrequencyEditor: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
-                ToolbarItem(placement: .primaryAction) {
-                    Button("Tune") {
-                        if let mhz = Double(text) {
-                            commit(UInt64(mhz * 1_000_000))
-                        }
-                        dismiss()
-                    }
-                }
             }
+            .onAppear { fieldFocused = true }
         }
+    }
+
+    private var hint: String {
+        if text.isEmpty { return "Enter a frequency in MHz (e.g. 144.800)" }
+        if parsedHz == nil { return "Invalid number" }
+        return "Press Tune to retune"
     }
 }
