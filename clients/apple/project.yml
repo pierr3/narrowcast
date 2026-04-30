@@ -64,6 +64,10 @@ targets:
         # transport; that falls under the 5D002 mass-market exemption so a
         # full export classification isn't needed. Setting this to false
         # makes TestFlight submission skip the manual classification prompt.
+        # App Store / TestFlight require an asset-catalog AppIcon and
+        # CFBundleIconName referencing it. The build setting below tells
+        # the asset compiler which icon set to extract.
+        CFBundleIconName: AppIcon
         ITSAppUsesNonExemptEncryption: false
         # Required for connecting to an unresolved / .local Pi on the LAN.
         # Connecting to the relay over a public domain doesn't need this,
@@ -88,6 +92,7 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Apple Distribution"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       configs:
         Debug:
           # No Apple Development cert on this Mac, so Debug builds skip
