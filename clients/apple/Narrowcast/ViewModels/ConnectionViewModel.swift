@@ -28,6 +28,8 @@ final class ConnectionViewModel: ObservableObject {
     @Published var squelchDb: Float = -80
     @Published var clientCount: UInt8 = 0
     @Published var streaming: Bool = false
+    @Published var autoGain: Bool = true
+    @Published var manualGainDb: Float = 20  // RTL-SDR R820T sensible default
     @Published var lastLoss: LossTracker.Sample?
     @Published var audioPacketsReceived: Int = 0
     @Published var fftFrameLatest: [UInt8] = []
@@ -129,8 +131,16 @@ final class ConnectionViewModel: ObservableObject {
         Task { try? await client?.send(.setSquelch(dBm: db)) }
     }
 
-    func setGain(autoGain: Bool, db: Float) {
-        Task { try? await client?.send(.setGain(dB: autoGain ? 0 : db)) }
+    func setAutoGain(_ on: Bool) {
+        autoGain = on
+        Task { try? await client?.send(.setGain(dB: on ? 0 : manualGainDb)) }
+    }
+
+    func setManualGain(_ db: Float) {
+        manualGainDb = db
+        if !autoGain {
+            Task { try? await client?.send(.setGain(dB: db)) }
+        }
     }
 
     private func runEventPump(client: NarrowcastClient) async {

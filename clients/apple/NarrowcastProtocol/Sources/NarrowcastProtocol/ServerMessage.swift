@@ -30,12 +30,15 @@ public enum ServerMessage: Sendable {
             return .fft(bins: Array(raw))
 
         case DatagramType.status.rawValue:
-            // [f32 smeter][f32 squelch][u8 mode][u64 freq] then optional [u8 clientCount]
+            // Current: [f32 smeter][f32 squelch][u8 mode][u64 freq] (+ optional u8 clientCount)
+            // Older Pi builds (pre-2c25906) emit only [f32 smeter][f32 squelch][u8 mode]
+            // (10 B + relay-appended client count = 11 B). Tolerate both so a
+            // not-yet-redeployed Pi still drives the S-meter and mode pickup.
             guard let s = try? r.f32LE() else { return nil }
             guard let q = try? r.f32LE() else { return nil }
             guard let mb = try? r.u8() else { return nil }
-            guard let f = try? r.u64LE() else { return nil }
             let mode = DemodMode(rawValue: mb) ?? .nfm
+            let f: UInt64 = (try? r.u64LE()) ?? 0
             let cc: UInt8? = (try? r.u8())
             return .status(smeter: s, squelch: q, mode: mode, freq: f, clientCount: cc)
 

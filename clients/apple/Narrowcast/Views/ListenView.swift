@@ -10,15 +10,16 @@ struct ListenView: View {
     @State private var showFreqEditor = false
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 14) {
             statusBar
             freqDisplay
             modePicker
             sMeter
             squelch
-            waterfall
-                .frame(height: 220)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+            gainControl
+            // Waterfall disabled — 1024-bin Canvas redraw at 10 fps melted
+            // the main thread. Re-enable behind a perf-tuned renderer
+            // (single CGImage row update, or Metal texture quad blit).
             Spacer(minLength: 0)
             playStop
         }
@@ -73,15 +74,21 @@ struct ListenView: View {
     }
 
     private var freqDisplay: some View {
-        Button {
-            showFreqEditor = true
-        } label: {
-            Text(formatFreq(vm.freqHz))
-                .font(.system(size: 44, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.primary)
-        }
-        .buttonStyle(.plain)
+        // Plain Text + onTapGesture beats Button(.plain) here — Button with a
+        // custom label doesn't always pick up taps on iOS 18 when the label
+        // is centred with no implicit frame.
+        Text(freqLabel)
+            .font(.system(size: 42, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .foregroundStyle(vm.freqHz == 0 ? .secondary : .primary)
+            .frame(maxWidth: .infinity, minHeight: 64)
+            .contentShape(Rectangle())
+            .onTapGesture { showFreqEditor = true }
+    }
+
+    private var freqLabel: String {
+        if vm.freqHz == 0 { return "Tap to tune" }
+        return formatFreq(vm.freqHz)
     }
 
     private var modePicker: some View {
@@ -120,6 +127,31 @@ struct ListenView: View {
                 get: { Double(vm.squelchDb) },
                 set: { vm.setSquelch(Float($0)) }
             ), in: -120...0)
+        }
+    }
+
+    @ViewBuilder
+    private var gainControl: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Gain").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Toggle("Auto", isOn: Binding(
+                    get: { vm.autoGain },
+                    set: { vm.setAutoGain($0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                Text(vm.autoGain ? "auto" : "\(Int(vm.manualGainDb)) dB")
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    .frame(minWidth: 56, alignment: .trailing)
+            }
+            if !vm.autoGain {
+                Slider(value: Binding(
+                    get: { Double(vm.manualGainDb) },
+                    set: { vm.setManualGain(Float($0)) }
+                ), in: 0...49.6, step: 0.1)
+            }
         }
     }
 
