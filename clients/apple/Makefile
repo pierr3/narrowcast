@@ -29,10 +29,24 @@ ASC_KEY_ID    ?= $(shell echo $${ASC_KEY_ID})
 ASC_ISSUER_ID ?= $(shell echo $${ASC_ISSUER_ID})
 ASC_KEY_PATH  := $(HOME)/.appstoreconnect/private_keys/AuthKey_$(ASC_KEY_ID).p8
 
-.PHONY: project build archive export upload-testflight clean
+.PHONY: project build archive export upload-testflight bump-build release clean
 
 project:
 	xcodegen
+
+# Increment CURRENT_PROJECT_VERSION in project.yml then regenerate the
+# xcodeproj. TestFlight rejects a re-upload with the same build number, so
+# this gets called before every release. MARKETING_VERSION stays put.
+bump-build:
+	@current=$$(awk '/CURRENT_PROJECT_VERSION:/ { gsub(/"/,"",$$2); print $$2; exit }' project.yml); \
+	next=$$((current + 1)); \
+	echo "build number $$current → $$next"; \
+	sed -i '' "s/CURRENT_PROJECT_VERSION: \"$$current\"/CURRENT_PROJECT_VERSION: \"$$next\"/" project.yml; \
+	xcodegen
+
+# One-shot: bump build → archive → export → upload. Used for an actual
+# TestFlight push.
+release: bump-build upload-testflight
 
 build: project
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) \
