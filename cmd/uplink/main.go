@@ -122,7 +122,12 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 
-	// Local (Pi) → Relay (for fan-out to clients)
+	// Capture which side died first so the parent log line can tell us
+	// whether the local narrowcast dropped us or the public relay did.
+	var localErr, relayErr error
+	var errMu sync.Mutex
+
+	// Local (Pi narrowcast) → Relay (fan-out to clients)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -130,13 +135,18 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 		for {
 			dg, err := localConn.ReceiveDatagram(bridgeCtx)
 			if err != nil {
+				errMu.Lock()
+				if localErr == nil {
+					localErr = err
+				}
+				errMu.Unlock()
 				return
 			}
 			_ = relayConn.SendDatagram(dg)
 		}
 	}()
 
-	// Relay (client commands) → Local (Pi)
+	// Relay (client commands) → Local (Pi narrowcast)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -144,6 +154,11 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 		for {
 			dg, err := relayConn.ReceiveDatagram(bridgeCtx)
 			if err != nil {
+				errMu.Lock()
+				if relayErr == nil {
+					relayErr = err
+				}
+				errMu.Unlock()
 				return
 			}
 			_ = localConn.SendDatagram(dg)
@@ -151,5 +166,16 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 	}()
 
 	wg.Wait()
-	return fmt.Errorf("bridge closed")
+	errMu.Lock()
+	defer errMu.Unlock()
+	switch {
+	case localErr != nil && relayErr == nil:
+		return fmt.Errorf("local narrowcast dropped: %w", localErr)
+	case relayErr != nil && localErr == nil:
+		return fmt.Errorf("relay dropped: %w", relayErr)
+	case localErr != nil && relayErr != nil:
+		return fmt.Errorf("local: %v, relay: %v", localErr, relayErr)
+	default:
+		return fmt.Errorf("bridge closed (no recorded error)")
+	}
 }
