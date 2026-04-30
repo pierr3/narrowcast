@@ -44,8 +44,20 @@ targets:
           UIColorName: ""
         UIBackgroundModes:
           - audio
+        # Support every orientation. iPad multitasking (split view, slide
+        # over) requires this — without it Xcode warns and the App Store
+        # rejects iPad submissions. SwiftUI adapts the layout, so no extra
+        # work needed on the view side.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortraitUpsideDown
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortraitUpsideDown
         UIRequiredDeviceCapabilities:
           - arm64
         # Encryption export compliance. We use TLS 1.3 / standard QUIC for
