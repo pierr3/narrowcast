@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/pierr3/narrowcast/pkg/protocol"
 	"github.com/quic-go/quic-go"
@@ -69,6 +70,14 @@ func (r *relay) run(ctx context.Context, listenAddr, certFile, keyFile string) e
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
 		Allow0RTT:       true,
+		// Symmetric keepalive on the listener side. quic-go's default
+		// MaxIdleTimeout is 30 s; if the uplink's PINGs ever skip a beat
+		// (NAT churn, brief network blip) the relay would drop. Sending
+		// our own PING every 10 s + a 60 s idle ceiling means it takes
+		// six consecutive missed PINGs to declare the link dead — far
+		// more resilient than the baseline 30 s no-traffic guillotine.
+		KeepAlivePeriod: 10 * time.Second,
+		MaxIdleTimeout:  60 * time.Second,
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)

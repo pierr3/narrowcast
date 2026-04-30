@@ -60,7 +60,11 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 		// the client times out waiting for Welcome. Send a PING every 15 s
 		// to suppress idle timeout. Also bump MaxIdleTimeout so a brief
 		// network blip doesn't tear the link down before the next ping.
-		KeepAlivePeriod: 15 * time.Second,
+		// PING every 10 s, idle ceiling 60 s — same numbers on both sides
+		// of the link so neither party can be the weak one. ISP-level NAT
+		// timeouts are typically 30-60 s for UDP, so 10 s keeps the
+		// mapping fresh through aggressive routers too.
+		KeepAlivePeriod: 10 * time.Second,
 		MaxIdleTimeout:  60 * time.Second,
 	}
 
