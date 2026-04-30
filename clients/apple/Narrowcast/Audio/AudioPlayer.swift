@@ -1,20 +1,22 @@
 import Foundation
 import AVFoundation
+import os
 
 #if canImport(UIKit)
 import UIKit
 #endif
 
-// AudioPlayer is the playback side of the audio pipeline. It owns an
-// AVAudioEngine + AVAudioSourceNode, holds a small ring buffer of decoded
-// PCM, and the system audio render callback consumes samples directly. The
-// callback runs on a real-time thread and must not block — the ring buffer
-// uses a plain spinlock so writes are bounded-latency.
+// AudioPlayer is the playback side of the audio pipeline. AVAudioEngine +
+// AVAudioSourceNode + a small lock-protected ring buffer. Render callback
+// runs on the realtime audio thread and reads from the ring; the audio queue
+// writes to it from off-main. os_unfair_lock (via OSAllocatedUnfairLock) is
+// used for the few-microsecond critical section because it handles priority
+// inversion correctly — NSLock can starve the realtime thread.
 //
-// Jitter buffer sizing: the server emits one Opus frame every 20 ms. We aim
-// to keep ~60 ms (3 frames) of decoded audio pre-rolled before unmuting
-// playback, which absorbs typical mobile microbursts. Larger buffers add
-// latency, smaller ones gap-out under any blip.
+// Preroll: the engine doesn't start until ~60 ms of decoded PCM (3 packets)
+// is sitting in the ring. Without this, the render callback drains the
+// empty ring on first tick, gaps out, the next packet arrives, plays, then
+// drains the ring again — choppy.
 public final class AudioPlayer: @unchecked Sendable {
 
     public let sampleRate: Double
@@ -23,9 +25,14 @@ public final class AudioPlayer: @unchecked Sendable {
     private let sourceNode: AVAudioSourceNode
     private let ring: PCMRing
 
-    public init(sampleRate: Int) throws {
+    private let prerollSamples: Int
+    private let startedFlag = OSAllocatedUnfairLock(initialState: false)
+    private let pendingStart: () -> Void
+
+    public init(sampleRate: Int, prerollMs: Int = 60) throws {
         self.sampleRate = Double(sampleRate)
-        self.ring = PCMRing(capacity: sampleRate)  // 1 second of headroom
+        self.prerollSamples = sampleRate * prerollMs / 1000
+        self.ring = PCMRing(capacity: sampleRate)  // 1 s headroom
 
         let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -41,7 +48,6 @@ public final class AudioPlayer: @unchecked Sendable {
             let n = Int(frameCount)
             let read = ringRef.read(into: dst, count: n)
             if read < n {
-                // Underrun: zero the rest. Better silence than glitch.
                 memset(dst.advanced(by: read), 0, (n - read) * MemoryLayout<Float>.size)
             }
             return noErr
@@ -49,31 +55,42 @@ public final class AudioPlayer: @unchecked Sendable {
 
         engine.attach(sourceNode)
         engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
-    }
 
-    public func start() throws {
-        try configureSession()
-        if !engine.isRunning {
-            try engine.start()
+        // Capture self-less closure so it can be called from the audio queue
+        // when the ring crosses prerollSamples.
+        let engineRef = engine
+        let flagRef = startedFlag
+        self.pendingStart = {
+            #if canImport(UIKit)
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+            try? AVAudioSession.sharedInstance().setActive(true)
+            #endif
+            let alreadyStarted = flagRef.withLock { state -> Bool in
+                if state { return true }
+                state = true
+                return false
+            }
+            if !alreadyStarted {
+                try? engineRef.start()
+            }
         }
     }
 
+    /// Stop the engine and clear pending audio. Safe to call from any thread.
     public func stop() {
         engine.stop()
         ring.clear()
+        startedFlag.withLock { $0 = false }
     }
 
+    /// Push decoded PCM into the ring. Triggers engine start once the ring
+    /// crosses the preroll threshold.
     public func enqueue(_ samples: [Float]) {
         ring.write(samples)
-    }
-
-    private func configureSession() throws {
-        #if canImport(UIKit)
-        let session = AVAudioSession.sharedInstance()
-        // .playback so audio continues when the screen locks (radio app).
-        try session.setCategory(.playback, mode: .default, options: [])
-        try session.setActive(true)
-        #endif
+        let started = startedFlag.withLock { $0 }
+        if !started && ring.count >= prerollSamples {
+            pendingStart()
+        }
     }
 }
 
@@ -84,7 +101,7 @@ final class PCMRing: @unchecked Sendable {
     private let capacity: Int
     private var head: Int = 0
     private var tail: Int = 0
-    private let lock = NSLock()
+    private let lock = OSAllocatedUnfairLock()
 
     init(capacity: Int) {
         self.capacity = capacity
@@ -99,35 +116,37 @@ final class PCMRing: @unchecked Sendable {
     }
 
     var count: Int {
-        lock.lock(); defer { lock.unlock() }
-        return (head - tail + capacity) % capacity
+        lock.withLock { (head - tail + capacity) % capacity }
     }
 
     func write(_ samples: [Float]) {
-        lock.lock(); defer { lock.unlock() }
-        for s in samples {
-            buffer[head] = s
-            head = (head + 1) % capacity
-            if head == tail {
-                tail = (tail + 1) % capacity  // overwrite oldest
+        lock.withLock {
+            for s in samples {
+                buffer[head] = s
+                head = (head + 1) % capacity
+                if head == tail {
+                    tail = (tail + 1) % capacity  // overwrite oldest
+                }
             }
         }
     }
 
     func read(into dst: UnsafeMutablePointer<Float>, count want: Int) -> Int {
-        lock.lock(); defer { lock.unlock() }
-        var produced = 0
-        while produced < want && tail != head {
-            dst[produced] = buffer[tail]
-            tail = (tail + 1) % capacity
-            produced += 1
+        lock.withLock {
+            var produced = 0
+            while produced < want && tail != head {
+                dst[produced] = buffer[tail]
+                tail = (tail + 1) % capacity
+                produced += 1
+            }
+            return produced
         }
-        return produced
     }
 
     func clear() {
-        lock.lock(); defer { lock.unlock() }
-        head = 0
-        tail = 0
+        lock.withLock {
+            head = 0
+            tail = 0
+        }
     }
 }

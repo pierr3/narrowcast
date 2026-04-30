@@ -73,7 +73,8 @@ final class ConnectionViewModel: ObservableObject {
                     self?.state = .connected
                     self?.bootAudio(sampleRate: 16000)
                 }
-                await self?.runEventPump(client: client)
+                let pipe = await MainActor.run { self?.pipeline }
+                await self?.runEventPump(client: client, pipeline: pipe)
             } catch NarrowcastClient.ConnectError.authFailed {
                 await MainActor.run { self?.state = .authFailed }
             } catch {
@@ -141,16 +142,19 @@ final class ConnectionViewModel: ObservableObject {
         }
     }
 
-    private func runEventPump(client: NarrowcastClient) async {
+    private nonisolated func runEventPump(client: NarrowcastClient,
+                                          pipeline: AudioPipeline?) async {
+        // Loop runs on a background context (not @MainActor). Audio takes
+        // the hot path straight to the AudioPipeline queue with no actor
+        // hop. UI events bounce to MainActor only when state changes.
         for await event in await client.events {
             switch event {
             case .audio(let opus):
-                // Hot path. No MainActor hop, no @Published mutation —
-                // straight into the audio queue.
                 pipeline?.feed(opus)
 
             case .fft(let bins):
-                guard waterfallEnabled else { continue }
+                let wantWaterfall = await MainActor.run { self.waterfallEnabled }
+                guard wantWaterfall else { continue }
                 await MainActor.run { self.appendFFT(bins) }
 
             default:

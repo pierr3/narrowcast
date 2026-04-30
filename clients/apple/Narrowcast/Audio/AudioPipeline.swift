@@ -18,8 +18,11 @@ final class AudioPipeline: @unchecked Sendable {
 
     init(sampleRate: Int) throws {
         self.decoder = try OpusDecoder(sampleRate: sampleRate)
+        // Player is created but NOT started — playback begins automatically
+        // once the ring buffer crosses its preroll threshold (~60 ms). That
+        // way the first render-callback tick draws from a non-empty ring
+        // instead of zero-filling and gapping out.
         self.player = try AudioPlayer(sampleRate: sampleRate)
-        try self.player.start()
     }
 
     func feed(_ opus: Data) {
