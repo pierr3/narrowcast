@@ -17,3 +17,13 @@ Package.resolved
 ## Opus xcframework build intermediates (the .xcframework itself IS committed
 ## under Vendor/, but the working dir is throwaway).
 .opus-build/
+
+## Archives + exported IPAs (built by `make archive` / `make export`)
+build/
+
+## Anything that smells like a private key — defence in depth so a stray
+## .p8/.p12/.cer next to the project doesn't end up in the repo.
+*.p8
+*.p12
+*.cer
+*.mobileprovision

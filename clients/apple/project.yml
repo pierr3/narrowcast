@@ -41,7 +41,16 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         UIRequiredDeviceCapabilities:
-          - armv7
+          - arm64
+        # Encryption export compliance. We use TLS 1.3 / standard QUIC for
+        # transport; that falls under the 5D002 mass-market exemption so a
+        # full export classification isn't needed. Setting this to false
+        # makes TestFlight submission skip the manual classification prompt.
+        ITSAppUsesNonExemptEncryption: false
+        # Required for connecting to an unresolved / .local Pi on the LAN.
+        # Connecting to the relay over a public domain doesn't need this,
+        # but the toggle lets users add a direct-Pi server entry.
+        NSLocalNetworkUsageDescription: Narrowcast connects to a Pi on your local network when you save a server with a private address.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.pierr3.narrowcast

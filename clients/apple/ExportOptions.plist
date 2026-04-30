@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ExportOptions for `xcodebuild -exportArchive`. Tells the exporter HOW to
+  package the .ipa: signing style, profile mapping, distribution method.
+  Does NOT contain the App Store Connect API key — that's passed separately
+  to xcodebuild / altool / notarytool via -authenticationKeyPath flags so
+  the secret never lands in a checked-in plist.
+
+  TEAM_ID: replace with your 10-char Apple Team ID.
+  PROFILE_NAME: replace with the exact display name of the App Store
+  distribution provisioning profile installed under
+  ~/Library/MobileDevice/Provisioning Profiles/.
+-->
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>app-store</string>
+
+    <key>destination</key>
+    <string>export</string>
+
+    <key>teamID</key>
+    <string>REPLACE_WITH_TEAM_ID</string>
+
+    <key>signingStyle</key>
+    <string>manual</string>
+
+    <key>signingCertificate</key>
+    <string>Apple Distribution</string>
+
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>com.pierr3.narrowcast</key>
+        <string>REPLACE_WITH_PROFILE_NAME</string>
+    </dict>
+
+    <!-- Strip Swift symbols from the uploaded binary. Smaller download. -->
+    <key>stripSwiftSymbols</key>
+    <true/>
+
+    <!-- TestFlight expects a specific bitcode handling; modern Xcode no
+         longer emits bitcode by default but the key is still accepted. -->
+    <key>uploadBitcode</key>
+    <false/>
+    <key>uploadSymbols</key>
+    <true/>
+</dict>
+</plist>
