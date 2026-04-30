@@ -73,6 +73,10 @@ targets:
         # Connecting to the relay over a public domain doesn't need this,
         # but the toggle lets users add a direct-Pi server entry.
         NSLocalNetworkUsageDescription: Narrowcast connects to a Pi on your local network when you save a server with a private address.
+        # Triggered when AVAudioSession routes playback to a Bluetooth
+        # speaker / headphones / AirPods. Without this Info.plist key iOS
+        # silently denies BT routing on some hardware/iOS combos.
+        NSBluetoothAlwaysUsageDescription: Narrowcast plays audio through your Bluetooth speakers, headphones, or AirPods when connected.
     # Signing.local.xcconfig (gitignored) provides DEVELOPMENT_TEAM and
     # PROVISIONING_PROFILE_SPECIFIER so the team ID + profile name never
     # land in version control. Copy Signing.example.xcconfig before first

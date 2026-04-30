@@ -24,6 +24,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Narrowcast plays audio through your Bluetooth speakers, headphones, or AirPods when connected.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Narrowcast connects to a Pi on your local network when you save a server with a private address.</string>
 	<key>UIBackgroundModes</key>

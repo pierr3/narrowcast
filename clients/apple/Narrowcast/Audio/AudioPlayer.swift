@@ -70,7 +70,15 @@ public final class AudioPlayer: @unchecked Sendable {
         let shouldStart = stateLock.withLock { state -> Bool in
             if !state.sessionConfigured {
                 #if canImport(UIKit)
-                try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+                // .allowBluetoothA2DP enables routing to Bluetooth speakers
+                // / AirPods (high-quality output profile). .allowAirPlay
+                // mirrors via AirPlay receivers. .playback alone defaults
+                // to handset speaker only on some routes.
+                try? AVAudioSession.sharedInstance().setCategory(
+                    .playback,
+                    mode: .default,
+                    options: [.allowBluetoothA2DP, .allowAirPlay]
+                )
                 try? AVAudioSession.sharedInstance().setActive(true)
                 #endif
                 state.sessionConfigured = true
