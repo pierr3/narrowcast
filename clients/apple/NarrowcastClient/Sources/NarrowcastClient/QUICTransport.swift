@@ -77,12 +77,7 @@ public actor QUICTransport {
         // datagram delivery.
         group.setReceiveHandler { [weak self] _, content, _ in
             guard let self else { return }
-            guard let content, !content.isEmpty else {
-                NSLog("[narrowcast] inbound: empty/no content (handshake artifact)")
-                return
-            }
-            let head = content.prefix(1).map { String(format: "0x%02x", $0) }.joined()
-            NSLog("[narrowcast] inbound: \(content.count)B head=\(head)")
+            guard let content, !content.isEmpty else { return }
             Task { await self.deliverInbound(content) }
         }
 
@@ -90,16 +85,18 @@ public actor QUICTransport {
             let resumeBox = ResumeOnce(cc)
             group.stateUpdateHandler = { [weak self] state in
                 guard let self else { return }
-                NSLog("[narrowcast] state: \(state)")
                 switch state {
                 case .ready:
                     resumeBox.resume(.success(()))
                 case .failed(let err):
+                    NSLog("[narrowcast] connection failed: \(err)")
                     resumeBox.resume(.failure(TransportError.connectionFailed(err)))
                     Task { await self.handleDisconnect() }
                 case .cancelled:
                     resumeBox.resume(.failure(TransportError.cancelled))
                     Task { await self.handleDisconnect() }
+                case .waiting(let err):
+                    NSLog("[narrowcast] connection waiting: \(err)")
                 default:
                     break
                 }
@@ -110,12 +107,10 @@ public actor QUICTransport {
 
     public func send(_ datagram: Data) async throws {
         guard let group = self.group else { throw TransportError.notConnected }
-        let head = datagram.prefix(1).map { String(format: "0x%02x", $0) }.joined()
-        NSLog("[narrowcast] send: \(datagram.count)B head=\(head)")
         try await withCheckedThrowingContinuation { (cc: CheckedContinuation<Void, Error>) in
             group.send(content: datagram) { err in
                 if let err {
-                    NSLog("[narrowcast] send err: \(err)")
+                    NSLog("[narrowcast] send error: \(err)")
                     cc.resume(throwing: TransportError.sendFailed(err))
                 } else {
                     cc.resume()

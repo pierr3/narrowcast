@@ -149,16 +149,17 @@ final class ConnectionViewModel: ObservableObject {
                                           holder: AudioPipelineHolder) async {
         // Loop runs on a background context (not @MainActor). Audio takes
         // the hot path straight to the AudioPipeline queue with no actor
-        // hop. UI events bounce to MainActor only when state changes.
+        // hop. FFT is dropped at the case head while waterfall is disabled
+        // (no MainActor.run roundtrip just to read a flag); when waterfall
+        // is reintroduced behind a perf-tuned renderer this case will
+        // route to it directly.
         for await event in await client.events {
             switch event {
             case .audio(let opus):
                 holder.feed(opus)
 
-            case .fft(let bins):
-                let wantWaterfall = await MainActor.run { self.waterfallEnabled }
-                guard wantWaterfall else { continue }
-                await MainActor.run { self.appendFFT(bins) }
+            case .fft:
+                continue
 
             default:
                 await MainActor.run { self.handle(event) }
