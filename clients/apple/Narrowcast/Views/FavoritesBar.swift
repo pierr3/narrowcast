@@ -41,7 +41,7 @@ struct FavoritesBar: View {
                     .lineLimit(1)
                     .foregroundStyle(.primary)
                 HStack(spacing: 6) {
-                    Text(String(format: "%.4f MHz", fav.freqMHz))
+                    Text(String(format: "%.3f MHz", fav.freqMHz))
                         .monospacedDigit()
                     Text("•").foregroundStyle(.tertiary)
                     Text(fav.mode.label)
@@ -100,7 +100,7 @@ struct AddFavoriteSheet: View {
                     TextField(autoName, text: $name)
                 }
                 Section("Snapshot") {
-                    LabeledContent("Frequency", value: String(format: "%.4f MHz", Double(vm.freqHz) / 1_000_000))
+                    LabeledContent("Frequency", value: String(format: "%.3f MHz", Double(vm.freqHz) / 1_000_000))
                     LabeledContent("Mode", value: vm.mode.label)
                     LabeledContent("Squelch", value: "\(Int(vm.squelchDb)) dB")
                     LabeledContent("Gain", value: vm.autoGain ? "auto" : "\(Int(vm.manualGainDb)) dB")
@@ -125,6 +125,6 @@ struct AddFavoriteSheet: View {
     }
 
     private var autoName: String {
-        String(format: "%.4f %@", Double(vm.freqHz) / 1_000_000, vm.mode.label)
+        String(format: "%.3f %@", Double(vm.freqHz) / 1_000_000, vm.mode.label)
     }
 }

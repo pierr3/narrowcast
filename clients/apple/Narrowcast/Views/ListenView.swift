@@ -198,7 +198,7 @@ struct ListenView: View {
     private func formatFreq(_ hz: UInt64) -> String {
         if hz == 0 { return "—" }
         let mhz = Double(hz) / 1_000_000
-        return String(format: "%.4f MHz", mhz)
+        return String(format: "%.3f MHz", mhz)
     }
 }
 
@@ -213,7 +213,7 @@ struct FrequencyEditor: View {
     init(initial: UInt64, commit: @escaping (UInt64) -> Void) {
         self.initial = initial
         self.commit = commit
-        _text = State(initialValue: initial == 0 ? "" : String(format: "%.4f", Double(initial) / 1_000_000))
+        _text = State(initialValue: initial == 0 ? "" : String(format: "%.3f", Double(initial) / 1_000_000))
     }
 
     private var parsedHz: UInt64? {
