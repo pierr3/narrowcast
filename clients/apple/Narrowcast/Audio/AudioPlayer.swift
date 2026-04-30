@@ -6,147 +6,112 @@ import os
 import UIKit
 #endif
 
-// AudioPlayer is the playback side of the audio pipeline. AVAudioEngine +
-// AVAudioSourceNode + a small lock-protected ring buffer. Render callback
-// runs on the realtime audio thread and reads from the ring; the audio queue
-// writes to it from off-main. os_unfair_lock (via OSAllocatedUnfairLock) is
-// used for the few-microsecond critical section because it handles priority
-// inversion correctly — NSLock can starve the realtime thread.
+// AudioPlayer schedules decoded PCM buffers on an AVAudioPlayerNode. The
+// engine handles per-sample scheduling internally — much more robust than
+// a hand-rolled ring + source node, which has to cope with the render
+// callback's variable frameCount and is prone to underruns when buffer
+// timing doesn't line up perfectly.
 //
-// Preroll: the engine doesn't start until ~60 ms of decoded PCM (3 packets)
-// is sitting in the ring. Without this, the render callback drains the
-// empty ring on first tick, gaps out, the next packet arrives, plays, then
-// drains the ring again — choppy.
+// Flow per decoded Opus packet:
+//   decoder -> AudioPlayer.enqueue([Float]) -> wrap in AVAudioPCMBuffer
+//   -> player.scheduleBuffer(buffer)  // engine plays in order
+//
+// Preroll: schedule the first ~3 packets without calling player.play(); the
+// engine queues them. play() unmutes on the third enqueue. After that the
+// engine pulls from its own queue at the device clock rate.
 public final class AudioPlayer: @unchecked Sendable {
 
     public let sampleRate: Double
 
     private let engine = AVAudioEngine()
-    private let sourceNode: AVAudioSourceNode
-    private let ring: PCMRing
+    private let player = AVAudioPlayerNode()
+    private let format: AVAudioFormat
 
-    private let prerollSamples: Int
-    private let startedFlag = OSAllocatedUnfairLock(initialState: false)
-    private let pendingStart: () -> Void
+    private let prerollFrames: Int  // packets, not samples
+    private let stateLock = OSAllocatedUnfairLock<State>(initialState: State())
 
-    public init(sampleRate: Int, prerollMs: Int = 150) throws {
+    private struct State {
+        var prerolledPackets: Int = 0
+        var playing: Bool = false
+        var sessionConfigured: Bool = false
+    }
+
+    public init(sampleRate: Int, prerollPackets: Int = 3) throws {
         self.sampleRate = Double(sampleRate)
-        self.prerollSamples = sampleRate * prerollMs / 1000
-        self.ring = PCMRing(capacity: sampleRate)  // 1 s headroom
+        self.prerollFrames = prerollPackets
 
-        let format = AVAudioFormat(
+        let fmt = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: Double(sampleRate),
             channels: 1,
             interleaved: false
         )!
+        self.format = fmt
 
-        let ringRef = ring
-        self.sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, abl -> OSStatus in
-            let buffers = UnsafeMutableAudioBufferListPointer(abl)
-            guard let dst = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-            let n = Int(frameCount)
-            let read = ringRef.read(into: dst, count: n)
-            if read < n {
-                memset(dst.advanced(by: read), 0, (n - read) * MemoryLayout<Float>.size)
-            }
-            return noErr
-        }
-
-        engine.attach(sourceNode)
-        engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
-
-        // Capture self-less closure so it can be called from the audio queue
-        // when the ring crosses prerollSamples.
-        let engineRef = engine
-        let flagRef = startedFlag
-        self.pendingStart = {
-            #if canImport(UIKit)
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-            try? AVAudioSession.sharedInstance().setActive(true)
-            #endif
-            let alreadyStarted = flagRef.withLock { state -> Bool in
-                if state { return true }
-                state = true
-                return false
-            }
-            if !alreadyStarted {
-                try? engineRef.start()
-            }
-        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: fmt)
     }
 
-    /// Stop the engine and clear pending audio. Safe to call from any thread.
     public func stop() {
+        player.stop()
         engine.stop()
-        ring.clear()
-        startedFlag.withLock { $0 = false }
-    }
-
-    /// Push decoded PCM into the ring. Triggers engine start once the ring
-    /// crosses the preroll threshold.
-    public func enqueue(_ samples: [Float]) {
-        ring.write(samples)
-        let started = startedFlag.withLock { $0 }
-        if !started && ring.count >= prerollSamples {
-            pendingStart()
+        stateLock.withLock { state in
+            state.prerolledPackets = 0
+            state.playing = false
         }
     }
-}
 
-// MARK: - Ring buffer
+    /// Schedule a chunk of decoded PCM. First few enqueues queue up without
+    /// playing; engine starts at the preroll threshold.
+    public func enqueue(_ samples: [Float]) {
+        guard !samples.isEmpty else { return }
+        guard let buffer = makeBuffer(from: samples) else { return }
 
-final class PCMRing: @unchecked Sendable {
-    private let buffer: UnsafeMutableBufferPointer<Float>
-    private let capacity: Int
-    private var head: Int = 0
-    private var tail: Int = 0
-    private let lock = OSAllocatedUnfairLock()
-
-    init(capacity: Int) {
-        self.capacity = capacity
-        let ptr = UnsafeMutablePointer<Float>.allocate(capacity: capacity)
-        ptr.initialize(repeating: 0, count: capacity)
-        self.buffer = UnsafeMutableBufferPointer(start: ptr, count: capacity)
-    }
-
-    deinit {
-        buffer.baseAddress?.deinitialize(count: capacity)
-        buffer.baseAddress?.deallocate()
-    }
-
-    var count: Int {
-        lock.withLock { (head - tail + capacity) % capacity }
-    }
-
-    func write(_ samples: [Float]) {
-        lock.withLock {
-            for s in samples {
-                buffer[head] = s
-                head = (head + 1) % capacity
-                if head == tail {
-                    tail = (tail + 1) % capacity  // overwrite oldest
+        let shouldStart = stateLock.withLock { state -> Bool in
+            if !state.sessionConfigured {
+                #if canImport(UIKit)
+                try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+                try? AVAudioSession.sharedInstance().setActive(true)
+                #endif
+                state.sessionConfigured = true
+            }
+            if !state.playing {
+                state.prerolledPackets &+= 1
+                if state.prerolledPackets >= prerollFrames {
+                    state.playing = true
+                    return true
                 }
             }
+            return false
         }
-    }
 
-    func read(into dst: UnsafeMutablePointer<Float>, count want: Int) -> Int {
-        lock.withLock {
-            var produced = 0
-            while produced < want && tail != head {
-                dst[produced] = buffer[tail]
-                tail = (tail + 1) % capacity
-                produced += 1
+        // Schedule first, then start the engine. If we started before
+        // scheduling, the engine could spin a tick on an empty player and
+        // mute briefly.
+        player.scheduleBuffer(buffer, completionHandler: nil)
+
+        if shouldStart {
+            do {
+                if !engine.isRunning { try engine.start() }
+                player.play()
+            } catch {
+                NSLog("[narrowcast] audio engine start: \(error)")
             }
-            return produced
         }
     }
 
-    func clear() {
-        lock.withLock {
-            head = 0
-            tail = 0
+    private func makeBuffer(from samples: [Float]) -> AVAudioPCMBuffer? {
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format,
+                                         frameCapacity: AVAudioFrameCount(samples.count)) else {
+            return nil
         }
+        buf.frameLength = AVAudioFrameCount(samples.count)
+        guard let dst = buf.floatChannelData?[0] else { return nil }
+        samples.withUnsafeBufferPointer { src in
+            if let base = src.baseAddress {
+                dst.update(from: base, count: samples.count)
+            }
+        }
+        return buf
     }
 }
