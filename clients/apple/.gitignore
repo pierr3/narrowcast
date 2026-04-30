@@ -13,3 +13,7 @@ Package.resolved
 
 ## OS
 .DS_Store
+
+## Opus xcframework build intermediates (the .xcframework itself IS committed
+## under Vendor/, but the working dir is throwaway).
+.opus-build/

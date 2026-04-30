@@ -6,6 +6,13 @@ options:
   createIntermediateGroups: true
   generateEmptyDirectories: true
 
+# Vendor/Opus.xcframework ships ios-arm64-simulator only (no x86_64 sim).
+# Apple Silicon Macs run sim arm64 natively; restricting here ensures the
+# linker doesn't try x86_64 and silently exclude every libopus object.
+settings:
+  base:
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+
 packages:
   NarrowcastProtocol:
     path: NarrowcastProtocol
@@ -21,6 +28,8 @@ targets:
     dependencies:
       - package: NarrowcastProtocol
       - package: NarrowcastClient
+      - framework: Vendor/Opus.xcframework
+        embed: false  # static library, no runtime embedding needed
     info:
       path: Narrowcast/Resources/Info.plist
       properties:
