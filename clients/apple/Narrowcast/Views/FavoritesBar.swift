@@ -2,8 +2,8 @@ import SwiftUI
 import NarrowcastProtocol
 
 // Horizontal scrolling bar of saved presets above the freq display. One tap
-// applies freq + mode + squelch + gain to the connected server. Long press
-// removes. Plus button captures the current state into a new entry.
+// applies freq + mode + squelch + gain. Long press opens a context menu to
+// remove. Plus button captures the current state into a new entry.
 struct FavoritesBar: View {
     @EnvironmentObject var store: FavoritesStore
     @ObservedObject var vm: ConnectionViewModel
@@ -12,9 +12,12 @@ struct FavoritesBar: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
                 ForEach(store.favorites) { fav in
                     chip(for: fav)
+                }
+                if store.favorites.isEmpty {
+                    emptyHint
                 }
                 addChip
             }
@@ -24,7 +27,7 @@ struct FavoritesBar: View {
         .frame(maxWidth: .infinity)
         .sheet(isPresented: $showAdd) {
             AddFavoriteSheet(vm: vm)
-                .presentationDetents([.height(220), .medium])
+                .presentationDetents([.medium])
         }
     }
 
@@ -32,20 +35,26 @@ struct FavoritesBar: View {
         Button {
             vm.applyFavorite(fav)
         } label: {
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(fav.name)
-                    .font(.caption.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
-                Text(String(format: "%.4f %@", fav.freqMHz, fav.mode.label))
-                    .font(.caption2)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.primary)
+                HStack(spacing: 6) {
+                    Text(String(format: "%.4f MHz", fav.freqMHz))
+                        .monospacedDigit()
+                    Text("•").foregroundStyle(.tertiary)
+                    Text(fav.mode.label)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(minWidth: 130, alignment: .leading)
+            .background(Color(.tertiarySystemFill), in: .rect(cornerRadius: 12))
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular, in: .capsule)
         .contextMenu {
             Button(role: .destructive) {
                 store.remove(id: fav.id)
@@ -55,16 +64,25 @@ struct FavoritesBar: View {
         }
     }
 
+    private var emptyHint: some View {
+        Text("Tap + to save the current freq")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 10)
+    }
+
     private var addChip: some View {
         Button {
             showAdd = true
         } label: {
             Image(systemName: "plus")
-                .font(.caption.weight(.bold))
-                .padding(12)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.tint)
+                .frame(width: 44, height: 44)
+                .background(Color(.tertiarySystemFill), in: .circle)
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: .circle)
         .disabled(vm.freqHz == 0)
     }
 }

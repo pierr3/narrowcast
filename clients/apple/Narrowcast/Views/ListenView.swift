@@ -10,36 +10,21 @@ struct ListenView: View {
     @State private var showFreqEditor = false
 
     var body: some View {
-        // GlassEffectContainer coordinates blur/lighting across nearby glass
-        // surfaces and lets them morph smoothly when content changes. Without
-        // it each .glassEffect() renders independently and overlapping
-        // surfaces don't blend.
-        GlassEffectContainer(spacing: 12) {
-            VStack(spacing: 14) {
-                statusBar
-                FavoritesBar(vm: vm)
-                freqDisplay
-                modePicker
-                sMeter
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 14))
-                squelch
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 14))
-                gainControl
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 14))
-                // Waterfall disabled — 1024-bin Canvas redraw at 10 fps
-                // pegged the main thread. Re-enable behind a Metal texture
-                // / CGImage row update.
-                Spacer(minLength: 0)
-                playStop
-            }
-            .padding()
+        VStack(spacing: 14) {
+            statusBar
+            FavoritesBar(vm: vm)
+            freqDisplay
+            modePicker
+            sMeter
+            squelch
+            gainControl
+            // Waterfall disabled — 1024-bin Canvas redraw at 10 fps pegged
+            // the main thread. Re-enable behind a Metal texture / CGImage
+            // row update.
+            Spacer(minLength: 0)
+            playStop
         }
+        .padding()
         .navigationTitle(server.name)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
@@ -94,10 +79,8 @@ struct ListenView: View {
             .font(.system(size: 42, weight: .semibold, design: .rounded))
             .monospacedDigit()
             .foregroundStyle(vm.freqHz == 0 ? .secondary : .primary)
-            .frame(maxWidth: .infinity, minHeight: 72)
-            .padding(.horizontal, 14)
+            .frame(maxWidth: .infinity, minHeight: 64)
             .contentShape(Rectangle())
-            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
             .onTapGesture { showFreqEditor = true }
     }
 
