@@ -5,7 +5,7 @@ struct ListenView: View {
     let server: Server
 
     @EnvironmentObject var store: ServerStore
-    @StateObject private var vm = ConnectionViewModel()
+    @EnvironmentObject var vm: ConnectionViewModel
     @State private var freqText: String = ""
     @State private var showFreqEditor = false
 
@@ -27,11 +27,21 @@ struct ListenView: View {
         .padding()
         .navigationTitle(server.name)
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            vm.connect(server: server, password: store.password(for: server.id))
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(role: .destructive) {
+                    vm.disconnect()
+                } label: {
+                    Image(systemName: "xmark.circle")
+                }
+                .disabled(vm.state != .connected && vm.state != .connecting)
+            }
         }
-        .onDisappear {
-            vm.disconnect()
+        .onAppear {
+            // Idempotent: connect() no-ops if already on this server.
+            // Connection survives nav pops back to ServersView, so re-entry
+            // is instant instead of a full QUIC re-handshake.
+            vm.connect(server: server, password: store.password(for: server.id))
         }
         .sheet(isPresented: $showFreqEditor) {
             FrequencyEditor(initial: vm.freqHz) { hz in

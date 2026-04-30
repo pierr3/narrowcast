@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // AudioPipeline owns the OpusDecoder + AudioPlayer pair and runs the decode
 // stage on a dedicated serial queue. The view model hands raw Opus packets
@@ -15,22 +16,26 @@ final class AudioPipeline: @unchecked Sendable {
     private let player: AudioPlayer
     private let queue = DispatchQueue(label: "narrowcast.audio", qos: .userInitiated)
     private var lastPacket: Data?  // touched only on `queue`; for FEC if we later wire it
+    private let mutedFlag = OSAllocatedUnfairLock<Bool>(initialState: false)
 
     init(sampleRate: Int) throws {
         self.decoder = try OpusDecoder(sampleRate: sampleRate)
-        // Player is created but NOT started — playback begins automatically
-        // once the ring buffer crosses its preroll threshold (~60 ms). That
-        // way the first render-callback tick draws from a non-empty ring
-        // instead of zero-filling and gapping out.
         self.player = try AudioPlayer(sampleRate: sampleRate)
     }
 
     func feed(_ opus: Data) {
+        let muted = mutedFlag.withLock { $0 }
+        if muted { return }  // client-side pause: drop incoming audio
         queue.async { [decoder, player] in
             if let pcm = decoder.decode(opus) {
                 player.enqueue(pcm)
             }
         }
+    }
+
+    func setMuted(_ muted: Bool) {
+        mutedFlag.withLock { $0 = muted }
+        if muted { player.stop() }  // engine.stop() drains and silences
     }
 
     func stop() {

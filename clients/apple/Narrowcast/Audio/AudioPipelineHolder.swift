@@ -34,4 +34,14 @@ final class AudioPipelineHolder: @unchecked Sendable {
         }
         old?.stop()
     }
+
+    /// Pause local playback (keeps the decoder + engine attached, just
+    /// stops feeding incoming Opus packets to the player).
+    func pause() {
+        lock.withLock { $0?.setMuted(true) }
+    }
+
+    func resume() {
+        lock.withLock { $0?.setMuted(false) }
+    }
 }

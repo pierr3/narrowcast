@@ -27,9 +27,14 @@ final class ConnectionViewModel: ObservableObject {
     @Published var sMeterDb: Float = -120
     @Published var squelchDb: Float = -80
     @Published var clientCount: UInt8 = 0
-    @Published var streaming: Bool = false
+    @Published var streaming: Bool = false  // local audio output gate
     @Published var autoGain: Bool = true
     @Published var manualGainDb: Float = 20
+
+    /// ID of the currently-connected server. Lets the UI no-op when the user
+    /// picks the same server they're already on, instead of tearing down +
+    /// reconnecting.
+    @Published var connectedServerId: UUID?
     @Published var lastLoss: LossTracker.Sample?
 
     // Waterfall data is only published when a consumer asks for it. SwiftUI
@@ -46,7 +51,16 @@ final class ConnectionViewModel: ObservableObject {
     private let pipelineHolder = AudioPipelineHolder()
 
     func connect(server: Server, password: String?) {
+        // Already on this server: re-entry from navigation, no-op.
+        if connectedServerId == server.id, state == .connected || state == .connecting {
+            return
+        }
+        // Switching servers: tear down the old connection first.
+        if connectedServerId != nil, connectedServerId != server.id {
+            disconnect()
+        }
         guard state != .connecting && state != .connected else { return }
+        connectedServerId = server.id
 
         // Relay always demands auth as the first datagram. Without a password
         // we'd ship Hello, the relay would close us with "unexpected", and
@@ -97,6 +111,7 @@ final class ConnectionViewModel: ObservableObject {
         pump?.cancel()
         pump = nil
         pipelineHolder.stop()
+        connectedServerId = nil
         let c = client
         client = nil
         Task {
@@ -108,20 +123,20 @@ final class ConnectionViewModel: ObservableObject {
         }
     }
 
+    /// Resume local audio output. The server pipeline keeps streaming
+    /// regardless — this is a client-side mute toggle, not a CmdStop. With
+    /// a multi-client relay deployment, sending CmdStop would force the SDR
+    /// to stop for everyone.
     func startStreaming() {
-        guard let client else { return }
-        Task {
-            try? await client.send(.start)
-            await MainActor.run { self.streaming = true }
-        }
+        pipelineHolder.resume()
+        streaming = true
     }
 
+    /// Pause local audio output without telling the server. Other listeners
+    /// keep hearing audio; we just stop pulling from the ring buffer.
     func stopStreaming() {
-        guard let client else { return }
-        Task {
-            try? await client.send(.stop)
-            await MainActor.run { self.streaming = false }
-        }
+        pipelineHolder.pause()
+        streaming = false
     }
 
     func setFrequency(_ hz: UInt64) {
