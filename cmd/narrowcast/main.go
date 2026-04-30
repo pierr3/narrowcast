@@ -576,10 +576,11 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 
 	// Status state (send ~4 times per second)
 	lastStatus := time.Now()
-	// 10 Hz status — fast enough that the S-meter feels responsive on the
-	// client without dominating the bandwidth budget. Status payload is
-	// ~18-19 B (with relay's client-count append), so 10 Hz = ~190 B/s.
-	statusInterval := 100 * time.Millisecond
+	// 20 Hz status. Status payload is ~18-19 B (incl. relay's client-count
+	// append), so 20 Hz = ~380 B/s — well inside the 14 KB/s budget. Client
+	// SwiftUI animates between samples for visually smooth meter motion, so
+	// going higher (e.g. 30+ Hz) gives diminishing returns on perception.
+	statusInterval := 50 * time.Millisecond
 	var signalPowerDb float32 = -120
 
 	for {

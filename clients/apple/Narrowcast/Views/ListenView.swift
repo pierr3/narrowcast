@@ -110,9 +110,13 @@ struct ListenView: View {
                 Spacer()
                 Text("\(Int(vm.sMeterDb)) dB").font(.caption).monospacedDigit()
             }
+            // Server pushes ~20 status samples/sec; SwiftUI interpolates
+            // between them so the meter slides at display rate (60-120 fps)
+            // instead of stepping in 50 ms blocks.
             ProgressView(value: sMeterFraction(vm.sMeterDb))
                 .progressViewStyle(.linear)
                 .tint(vm.sMeterDb > vm.squelchDb ? .green : .gray)
+                .animation(.easeOut(duration: 0.08), value: vm.sMeterDb)
         }
     }
 
