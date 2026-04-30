@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
@@ -39,6 +40,14 @@ func NewServer(addr string, certFile, keyFile string, handler ClientHandler) (*S
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
 		Allow0RTT:       true,
+		// Symmetric keepalive on the SDR-side QUIC listener. The uplink
+		// already sets KeepAlivePeriod on its dial; without the same on
+		// the listener, quic-go negotiates to whichever side has the
+		// shorter MaxIdleTimeout (default 30 s) and the link drops every
+		// 30 s — exactly the pattern the relay log was showing. 10 s
+		// PING / 60 s ceiling matches relay + uplink.
+		KeepAlivePeriod: 10 * time.Second,
+		MaxIdleTimeout:  60 * time.Second,
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
