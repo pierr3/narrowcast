@@ -9,7 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -34,9 +36,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Resolve the relay hostname ONCE at startup. The Pi's resolver
+	// (systemd-resolved) flakes during network blips and any reconnect
+	// triggered while it's recovering would wait the full DNS timeout
+	// per attempt. We cache the IP for the lifetime of the process so
+	// later reconnects are pure-IP dials. TLS cert validation is
+	// preserved by passing the original hostname as ServerName.
+	relayHost, relayPort, err := splitHostPort(*relayAddr)
+	if err != nil {
+		log.Fatalf("--relay must be host:port: %v", err)
+	}
+	relayUDP, err := resolveRelayWithFallback(ctx, relayHost, relayPort)
+	if err != nil {
+		log.Fatalf("could not resolve relay %s: %v", *relayAddr, err)
+	}
+	log.Printf("[uplink] relay %s resolved to %s (cached for process lifetime)", *relayAddr, relayUDP)
+
 	// Reconnect loop
 	for {
-		err := run(ctx, *local, *relayAddr, *uplinkKey)
+		err := run(ctx, *local, relayUDP, relayHost, *uplinkKey)
 		if ctx.Err() != nil {
 			return
 		}
@@ -49,39 +67,124 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
+// splitHostPort accepts "host:port" and returns parsed parts. Pulled out so
+// the result can be reused for both the resolve step and the TLS ServerName.
+func splitHostPort(addr string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("port: %w", err)
+	}
+	return host, port, nil
+}
+
+// resolveRelayWithFallback tries the system resolver first, then falls back
+// to public DNS (Cloudflare) if the system resolver is misbehaving. This
+// matters at startup on the Pi where systemd-resolved can be wedged and
+// returning SERVFAIL even though the upstream DNS is fine. Retries with
+// exponential backoff so network flakiness at boot doesn't kill the unit.
+func resolveRelayWithFallback(ctx context.Context, host string, port int) (*net.UDPAddr, error) {
+	publicResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 3 * time.Second}
+			return d.DialContext(ctx, network, "1.1.1.1:53")
+		},
+	}
+
+	backoff := 1 * time.Second
+	for {
+		// System resolver first — usually fine and respects local
+		// configuration like /etc/hosts overrides.
+		if ip, err := lookupOne(ctx, net.DefaultResolver, host); err == nil {
+			return &net.UDPAddr{IP: ip, Port: port}, nil
+		} else {
+			log.Printf("[uplink] system resolver failed for %s: %v — trying public DNS", host, err)
+		}
+		// Fallback: public DNS, bypassing systemd-resolved entirely.
+		if ip, err := lookupOne(ctx, publicResolver, host); err == nil {
+			log.Printf("[uplink] resolved %s via fallback resolver", host)
+			return &net.UDPAddr{IP: ip, Port: port}, nil
+		} else {
+			log.Printf("[uplink] public resolver also failed for %s: %v — retrying in %v", host, err, backoff)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func lookupOne(ctx context.Context, r *net.Resolver, host string) (net.IP, error) {
+	addrs, err := r.LookupHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no addresses for %s", host)
+	}
+	// Prefer the first IPv4 if one is available — IPv6-only paths to
+	// VPSes have caused unrelated MTU issues for some users on consumer
+	// ISPs. Fall back to whatever's first if no v4 is in the set.
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip != nil && ip.To4() != nil {
+			return ip.To4(), nil
+		}
+	}
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil {
+			return ip, nil
+		}
+	}
+	return nil, fmt.Errorf("no parseable IP for %s", host)
+}
+
+func run(ctx context.Context, localAddr string, relayUDP *net.UDPAddr, relayHost, uplinkKey string) error {
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
-		// quic-go's default idle timeout is 30 s. The uplink↔relay link sits
-		// idle whenever no client is streaming, so without a keepalive the
-		// connection drops every 30 s and reconnects. That window is exactly
-		// when a fresh client's Hello can land at the relay and find
-		// r.upstream == nil — the Hello is dropped, the Pi never sees it,
-		// the client times out waiting for Welcome. Send a PING every 15 s
-		// to suppress idle timeout. Also bump MaxIdleTimeout so a brief
-		// network blip doesn't tear the link down before the next ping.
-		// PING every 10 s, idle ceiling 60 s — same numbers on both sides
-		// of the link so neither party can be the weak one. ISP-level NAT
-		// timeouts are typically 30-60 s for UDP, so 10 s keeps the
-		// mapping fresh through aggressive routers too.
+		// PING every 10 s, idle ceiling 60 s — symmetric with relay +
+		// narrowcast listeners. Keeps NAT bindings warm and absorbs
+		// brief network blips before they tear the link down.
 		KeepAlivePeriod: 10 * time.Second,
 		MaxIdleTimeout:  60 * time.Second,
 	}
 
-	// Relay connection: verify TLS cert (Let's Encrypt or trusted CA).
-	// Dial relay FIRST — it's the failure-prone half (DNS, public net).
-	// systemd-resolved on the Pi sometimes wedges; instead of tearing down
-	// a perfectly fine local loopback connection on each DNS hiccup, retry
-	// the relay dial in-place with backoff until it succeeds.
+	// Build a UDP transport bound to an ephemeral local port. Reused
+	// across both Dial calls in this run() invocation; closed when run()
+	// returns so a fresh socket is allocated next reconnect (avoids
+	// stuck NAT mappings during prolonged network outages).
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return fmt.Errorf("listen udp: %w", err)
+	}
+	tr := &quic.Transport{Conn: udpConn}
+	defer tr.Close()
+
+	// Relay connection: dial cached IP, validate cert against the
+	// original hostname via ServerName. ServerName is what TLS uses for
+	// SNI and certificate verification, so the LE cert for the relay
+	// domain still matches even though we connected by IP.
 	relayTLS := &tls.Config{
 		NextProtos: []string{"narrowcast-v1"},
+		ServerName: relayHost,
 	}
 	var relayConn quic.Connection
 	backoff := 1 * time.Second
 	for {
-		var derr error
-		relayConn, derr = quic.DialAddr(ctx, relayAddr, relayTLS, quicConf)
+		dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		c, derr := tr.Dial(dialCtx, relayUDP, relayTLS, quicConf)
+		cancel()
 		if derr == nil {
+			relayConn = c
 			break
 		}
 		if ctx.Err() != nil {
@@ -98,7 +201,7 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 		}
 	}
 	defer relayConn.CloseWithError(0, "uplink-done")
-	log.Printf("[uplink] connected to relay at %s", relayAddr)
+	log.Printf("[uplink] connected to relay at %s", relayUDP)
 
 	// Local connection: self-signed Pi cert, skip verification.
 	localTLS := &tls.Config{
@@ -121,7 +224,6 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 		return fmt.Errorf("send uplink auth: %w", err)
 	}
 
-	// Wait for auth response
 	authResp, err := relayConn.ReceiveDatagram(ctx)
 	if err != nil {
 		return fmt.Errorf("auth response: %w", err)
