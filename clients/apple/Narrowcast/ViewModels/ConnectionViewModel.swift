@@ -37,6 +37,11 @@ final class ConnectionViewModel: ObservableObject {
     @Published var connectedServerId: UUID?
     @Published var lastLoss: LossTracker.Sample?
 
+    // Stable name for lock-screen Now Playing artist field. Captured at
+    // connect() time so we don't need to thread ServerStore in here.
+    private var connectedServerName: String = ""
+    private let nowPlaying = NowPlayingController()
+
     // Waterfall data is only published when a consumer asks for it. SwiftUI
     // would otherwise redraw on every 10 Hz FFT regardless of visibility.
     @Published var waterfallFrames: [[UInt8]] = []
@@ -63,6 +68,13 @@ final class ConnectionViewModel: ObservableObject {
         if case .connecting = state { return }
         if state == .connected { return }
         connectedServerId = server.id
+        connectedServerName = server.name
+
+        // Wire lock-screen play/pause + interruption handling once. Closures
+        // capture self weakly via the @MainActor methods.
+        nowPlaying.onPlay = { [weak self] in self?.startStreaming() }
+        nowPlaying.onPause = { [weak self] in self?.stopStreaming() }
+        nowPlaying.activate()
 
         // Relay always demands auth as the first datagram. Without a password
         // we'd ship Hello, the relay would close us with "unexpected", and
@@ -107,6 +119,7 @@ final class ConnectionViewModel: ObservableObject {
                     self?.serverInfo = info
                     self?.state = .connected
                     self?.bootAudio(sampleRate: 16000)
+                    self?.refreshNowPlaying()
                 }
                 // Settle: Apple QUIC on the simulator sometimes rejects an
                 // immediate post-handshake send with EINVAL. Half a second
@@ -143,6 +156,7 @@ final class ConnectionViewModel: ObservableObject {
         pump = nil
         pipelineHolder.stop()
         connectedServerId = nil
+        nowPlaying.deactivate()
         let c = client
         client = nil
         Task {
@@ -161,6 +175,7 @@ final class ConnectionViewModel: ObservableObject {
     func startStreaming() {
         pipelineHolder.resume()
         streaming = true
+        nowPlaying.setPlaying(true)
     }
 
     /// Pause local audio output without telling the server. Other listeners
@@ -168,15 +183,18 @@ final class ConnectionViewModel: ObservableObject {
     func stopStreaming() {
         pipelineHolder.pause()
         streaming = false
+        nowPlaying.setPlaying(false)
     }
 
     func setFrequency(_ hz: UInt64) {
         freqHz = hz // optimistic; may be reconciled by a status frame
+        refreshNowPlaying()
         Task { try? await client?.send(.setFrequency(hz: hz)) }
     }
 
     func setMode(_ m: DemodMode) {
         mode = m
+        refreshNowPlaying()
         Task { try? await client?.send(.setMode(m)) }
     }
 
@@ -264,6 +282,16 @@ final class ConnectionViewModel: ObservableObject {
         pipelineHolder.set(try? AudioPipeline(sampleRate: sampleRate))
     }
 
+    private func refreshNowPlaying() {
+        guard state == .connected else { return }
+        nowPlaying.updateMetadata(
+            stationName: connectedServerName,
+            freqHz: freqHz,
+            mode: mode,
+            playing: streaming
+        )
+    }
+
     private func handle(_ event: NarrowcastClient.Event) {
         switch event {
         case .welcome(let info):
@@ -289,6 +317,7 @@ final class ConnectionViewModel: ObservableObject {
                 freqHz = f
             }
             if let cc { clientCount = cc }
+            refreshNowPlaying()
 
         case .loss(let sample):
             lastLoss = sample

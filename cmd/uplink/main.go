@@ -68,7 +68,39 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 		MaxIdleTimeout:  60 * time.Second,
 	}
 
-	// Local connection: self-signed Pi cert, skip verification
+	// Relay connection: verify TLS cert (Let's Encrypt or trusted CA).
+	// Dial relay FIRST — it's the failure-prone half (DNS, public net).
+	// systemd-resolved on the Pi sometimes wedges; instead of tearing down
+	// a perfectly fine local loopback connection on each DNS hiccup, retry
+	// the relay dial in-place with backoff until it succeeds.
+	relayTLS := &tls.Config{
+		NextProtos: []string{"narrowcast-v1"},
+	}
+	var relayConn quic.Connection
+	backoff := 1 * time.Second
+	for {
+		var derr error
+		relayConn, derr = quic.DialAddr(ctx, relayAddr, relayTLS, quicConf)
+		if derr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("[uplink] relay dial failed: %v — retrying in %v", derr, backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 10*time.Second {
+			backoff *= 2
+		}
+	}
+	defer relayConn.CloseWithError(0, "uplink-done")
+	log.Printf("[uplink] connected to relay at %s", relayAddr)
+
+	// Local connection: self-signed Pi cert, skip verification.
 	localTLS := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"narrowcast-v1"},
@@ -79,17 +111,6 @@ func run(ctx context.Context, localAddr, relayAddr, uplinkKey string) error {
 	}
 	defer localConn.CloseWithError(0, "uplink-done")
 	log.Printf("[uplink] connected to local narrowcast at %s", localAddr)
-
-	// Relay connection: verify TLS cert (Let's Encrypt or trusted CA)
-	relayTLS := &tls.Config{
-		NextProtos: []string{"narrowcast-v1"},
-	}
-	relayConn, err := quic.DialAddr(ctx, relayAddr, relayTLS, quicConf)
-	if err != nil {
-		return fmt.Errorf("relay connect: %w", err)
-	}
-	defer relayConn.CloseWithError(0, "uplink-done")
-	log.Printf("[uplink] connected to relay at %s", relayAddr)
 
 	// Authenticate with relay
 	keyHash := sha256.Sum256([]byte(uplinkKey))

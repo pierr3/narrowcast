@@ -131,16 +131,24 @@ public actor NarrowcastClient {
         // bouncing or the first Hello was dropped before our client was in
         // the relay's fan-out map, we'd hang. Retry Hello a few times
         // before giving up — the Pi sends Welcome on every Hello received.
+        // viaRelay path gets a longer budget: relay reconnects (DNS flake,
+        // NAT churn on the Pi side) can take ~30 s before upstream is
+        // stable. While upstream is nil the relay silently drops Hellos,
+        // so the only thing the client can do is keep poking.
+        let welcomeTimeout: TimeInterval = viaRelay ? 25.0 : 8.0
         let welcome = OneShot<ServerInfo>(
-            timeout: 8.0,
+            timeout: welcomeTimeout,
             onTimeout: ConnectError.welcomeTimeout(viaRelay: viaRelay)
         )
         self.welcomeWaiter = welcome
         try await transport.send(ClientMessage.hello().encode())
 
-        // Background re-sender; cancels if Welcome arrives.
+        // Background re-sender; cancels if Welcome arrives. Cadence is
+        // tuned to the timeout: ~every 1.5 s for the whole budget so a
+        // late-arriving upstream still gets a Hello in flight.
+        let retryCount = viaRelay ? 15 : 4
         let retry = Task { [weak self] in
-            for _ in 0..<3 {
+            for _ in 0..<retryCount {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if Task.isCancelled { return }
                 guard let self else { return }
