@@ -211,20 +211,46 @@ final class ConnectionViewModel: ObservableObject {
         Task { try? await client?.send(.setMode(m)) }
     }
 
+    /// Trailing-edge debouncers for slider-driven commands. SwiftUI fires
+    /// the binding setter on every drag delta — without this the server
+    /// log is a wall of identical-modulo-noise updates, the QUIC datagram
+    /// queue fills with stale tunings, and the encoder churns settings
+    /// it'll immediately overwrite. Cancelling the prior pending task
+    /// each call means only the final value (or one every 150 ms while
+    /// the user pauses mid-drag) reaches the wire.
+    private var squelchSendTask: Task<Void, Never>?
+    private var gainSendTask: Task<Void, Never>?
+    private static let sliderDebounceNs: UInt64 = 150_000_000
+
     func setSquelch(_ db: Float) {
         squelchDb = db
-        Task { try? await client?.send(.setSquelch(dBm: db)) }
+        squelchSendTask?.cancel()
+        squelchSendTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.sliderDebounceNs)
+            if Task.isCancelled { return }
+            try? await self?.client?.send(.setSquelch(dBm: db))
+        }
     }
 
     func setAutoGain(_ on: Bool) {
         autoGain = on
+        // Toggle, not a slider — fire immediately. Cancel any pending
+        // manual-gain send so an in-flight slider value doesn't land
+        // after the toggle and re-enable manual gain on the server.
+        gainSendTask?.cancel()
+        gainSendTask = nil
         Task { try? await client?.send(.setGain(dB: on ? 0 : manualGainDb)) }
     }
 
     func setManualGain(_ db: Float) {
         manualGainDb = db
         if !autoGain {
-            Task { try? await client?.send(.setGain(dB: db)) }
+            gainSendTask?.cancel()
+            gainSendTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: Self.sliderDebounceNs)
+                if Task.isCancelled { return }
+                try? await self?.client?.send(.setGain(dB: db))
+            }
         }
     }
 
