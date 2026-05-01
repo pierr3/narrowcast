@@ -278,6 +278,16 @@ final class ConnectionViewModel: ObservableObject {
         // the Metal renderer can snapshot it per frame; no MainActor hop
         // on the FFT hot path either, since the spectrum view doesn't go
         // through SwiftUI redraws.
+        //
+        // Non-audio events are dispatched to the MainActor as fire-and-
+        // forget Tasks rather than awaited. Awaiting blocked the pump
+        // whenever the main thread was busy, which made any main-thread
+        // stall (heavy SwiftUI redraw, an unexpected system IPC, etc.)
+        // also stall the audio pump — audio glitched in lockstep with
+        // the UI. Submitted Tasks run on the MainActor in submission
+        // order, so we don't reorder events; the worst case is a brief
+        // backlog of pending Tasks if main stalls, which clears
+        // automatically.
         let spectrum = self.spectrumStore
         for await event in await client.events {
             switch event {
@@ -288,7 +298,9 @@ final class ConnectionViewModel: ObservableObject {
                 spectrum.update(bins: bins)
 
             default:
-                await MainActor.run { self.handle(event) }
+                Task { @MainActor [weak self] in
+                    self?.handle(event)
+                }
             }
         }
         await MainActor.run {
