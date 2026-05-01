@@ -216,14 +216,33 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     /// Apply a Favorite by sending the four commands the preset captures.
-    /// Mode goes first so the demod chain is rebuilt before frequency lands.
+    /// QUIC datagrams are unordered, and the previous implementation
+    /// dispatched four independent Task {}s — frequency commonly arrived
+    /// before mode, the mode change rebuilt the DSP chain, and the tune
+    /// was lost. Now: update UI optimistically, then send everything in
+    /// one sequential Task so each command awaits the previous send.
     func applyFavorite(_ f: Favorite) {
-        setMode(f.mode)
-        setFrequency(f.freqHz)
-        setSquelch(f.squelchDb)
+        // Optimistic UI updates. Reload the audio pipeline if mode change
+        // implies a new sample rate (e.g. NFM 16 kHz -> WFM 48 kHz),
+        // mirroring the handle(.status) flow.
+        let prevMode = mode
+        mode = f.mode
+        freqHz = f.freqHz
+        squelchDb = f.squelchDb
         autoGain = f.gainAuto
         manualGainDb = f.gainDb
-        Task { try? await client?.send(.setGain(dB: f.gainAuto ? 0 : f.gainDb)) }
+        refreshNowPlaying()
+        if sampleRate(for: f.mode) != sampleRate(for: prevMode) {
+            pipelineHolder.set(try? AudioPipeline(sampleRate: sampleRate(for: f.mode)))
+        }
+
+        guard let client else { return }
+        Task {
+            try? await client.send(.setMode(f.mode))
+            try? await client.send(.setFrequency(hz: f.freqHz))
+            try? await client.send(.setSquelch(dBm: f.squelchDb))
+            try? await client.send(.setGain(dB: f.gainAuto ? 0 : f.gainDb))
+        }
     }
 
     /// Build a Favorite snapshot from the current UI/state.
