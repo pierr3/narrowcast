@@ -188,7 +188,7 @@ struct ListenView: View {
         return VStack(spacing: 4) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.black.opacity(0.65))
+                    .fill(Color(.secondarySystemBackground))
                 SpectrumView(store: vm.spectrumStore, squelchDb: vm.squelchDb)
                     .padding(.vertical, 4)
                     .padding(.horizontal, 2)

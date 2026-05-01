@@ -197,16 +197,16 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         enc.setVertexBuffer(fillVertexBuffer, offset: 0, index: 0)
         enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: fillVertexCount)
 
-        // --- Draw peak hold (faint white) ---
+        // --- Draw peak hold (mid gray, reads on white) ---
         enc.setRenderPipelineState(linePipeline)
         enc.setVertexBuffer(peakLineBuffer, offset: 0, index: 0)
-        var peakColor = SIMD4<Float>(1.0, 1.0, 1.0, 0.35)
+        var peakColor = SIMD4<Float>(0.35, 0.40, 0.50, 0.55)
         enc.setFragmentBytes(&peakColor, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
         enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: peakLineCount)
 
-        // --- Draw top edge (bright cyan) ---
+        // --- Draw top edge (deep blue stroke for definition on white) ---
         enc.setVertexBuffer(topLineBuffer, offset: 0, index: 0)
-        var topColor = SIMD4<Float>(0.45, 0.85, 1.0, 1.0)
+        var topColor = SIMD4<Float>(0.05, 0.35, 0.80, 1.0)
         enc.setFragmentBytes(&topColor, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
         enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: topLineCount)
 
@@ -247,10 +247,10 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         ptr[dashVerts + 1] = SIMD2<Float>(0.5, yScale)
 
         decorSegments = [
-            // squelch, warm orange
-            (start: 0, count: dashVerts, color: SIMD4<Float>(1.0, 0.55, 0.35, 0.9)),
-            // crosshair, faint white
-            (start: dashVerts, count: 2, color: SIMD4<Float>(1.0, 1.0, 1.0, 0.25)),
+            // squelch, warm orange — pops on either light or dark
+            (start: 0, count: dashVerts, color: SIMD4<Float>(0.95, 0.45, 0.15, 0.95)),
+            // crosshair, dim ink — reads on white, fades on dark
+            (start: dashVerts, count: 2, color: SIMD4<Float>(0.15, 0.20, 0.30, 0.35)),
         ]
     }
 }
