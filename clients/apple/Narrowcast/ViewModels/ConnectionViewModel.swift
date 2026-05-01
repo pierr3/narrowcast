@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import QuartzCore
 import SwiftUI
 import NarrowcastProtocol
 import NarrowcastClient
@@ -25,6 +26,14 @@ final class ConnectionViewModel: ObservableObject {
     @Published var freqHz: UInt64 = 0
     @Published var mode: DemodMode = .nfm
     @Published var sMeterDb: Float = -120
+    /// Peak-hold companion to sMeterDb. Holds the most recent peak then
+    /// decays at a fixed dB/sec so the UI shows a falling tick after a
+    /// burst transmission, classic analog meter behaviour.
+    @Published var sMeterPeakDb: Float = -120
+    private var lastStatusAt: CFTimeInterval = CACurrentMediaTime()
+    /// dB / second decay rate after a peak. 12 dB/s holds the tick at the
+    /// signal level for ~1 s of useful read time before falling.
+    private let peakDecayPerSec: Float = 12
     @Published var squelchDb: Float = -80
     @Published var clientCount: UInt8 = 0
     @Published var streaming: Bool = false  // local audio output gate
@@ -323,6 +332,16 @@ final class ConnectionViewModel: ObservableObject {
 
         case .status(let s, let q, let m, let f, let cc):
             sMeterDb = s
+            // Peak hold: snap up on rising edge, decay on falling edge by
+            // wall-clock delta since the last status frame.
+            let now = CACurrentMediaTime()
+            let dt = Float(max(0, now - lastStatusAt))
+            lastStatusAt = now
+            if s >= sMeterPeakDb {
+                sMeterPeakDb = s
+            } else {
+                sMeterPeakDb = max(s, sMeterPeakDb - peakDecayPerSec * dt)
+            }
             squelchDb = q
 
             if m != mode {

@@ -1,5 +1,6 @@
 import SwiftUI
 import NarrowcastProtocol
+import NarrowcastClient
 
 struct ListenView: View {
     let server: Server
@@ -51,10 +52,13 @@ struct ListenView: View {
 
     @ViewBuilder
     private var statusBar: some View {
-        HStack {
+        HStack(spacing: 8) {
             Circle().fill(stateColor).frame(width: 10, height: 10)
             Text(stateLabel).font(.caption).foregroundStyle(.secondary)
             Spacer()
+            if let loss = vm.lastLoss {
+                LossBadge(sample: loss)
+            }
             if vm.clientCount > 0 {
                 Image(systemName: "person.2.fill").font(.caption)
                 Text("\(vm.clientCount)").font(.caption).monospacedDigit()
@@ -118,11 +122,24 @@ struct ListenView: View {
             }
             // Server pushes ~20 status samples/sec; SwiftUI interpolates
             // between them so the meter slides at display rate (60-120 fps)
-            // instead of stepping in 50 ms blocks.
-            ProgressView(value: sMeterFraction(vm.sMeterDb))
-                .progressViewStyle(.linear)
-                .tint(vm.sMeterDb > vm.squelchDb ? .green : .gray)
-                .animation(.easeOut(duration: 0.08), value: vm.sMeterDb)
+            // instead of stepping in 50 ms blocks. Peak-hold tick is an
+            // overlay positioned via GeometryReader so it tracks the bar
+            // width whatever the layout.
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    ProgressView(value: sMeterFraction(vm.sMeterDb))
+                        .progressViewStyle(.linear)
+                        .tint(vm.sMeterDb > vm.squelchDb ? .green : .gray)
+                        .animation(.easeOut(duration: 0.08), value: vm.sMeterDb)
+
+                    Rectangle()
+                        .fill(Color.orange)
+                        .frame(width: 2, height: 14)
+                        .offset(x: geo.size.width * sMeterFraction(vm.sMeterPeakDb) - 1, y: -1)
+                        .animation(.linear(duration: 0.08), value: vm.sMeterPeakDb)
+                }
+            }
+            .frame(height: 14)
         }
     }
 
@@ -229,6 +246,36 @@ struct ListenView: View {
         if hz == 0 { return "—" }
         let mhz = Double(hz) / 1_000_000
         return String(format: "%.3f MHz", mhz)
+    }
+}
+
+// LossBadge surfaces the QualityReport loop's measurement: a coloured dot
+// scaled to severity + the audio loss percentage. The fft loss number
+// matters too but is generally proportional to audio loss so showing both
+// is noisy; tap-to-expand could surface fft + windowMs later.
+struct LossBadge: View {
+    let sample: LossTracker.Sample
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Text("\(sample.audioLossPct)%")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(Color(.tertiarySystemBackground)))
+    }
+
+    private var color: Color {
+        switch sample.audioLossPct {
+        case 0..<5:   return .green
+        case 5..<15:  return .yellow
+        default:      return .red
+        }
     }
 }
 
