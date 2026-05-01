@@ -63,8 +63,13 @@ final class NowPlayingController {
             object: AVAudioSession.sharedInstance(),
             queue: .main
         ) { [weak self] note in
-            guard let self else { return }
-            self.handleInterruption(note)
+            // queue: .main ensures the callback already runs on the main
+            // thread, so MainActor.assumeIsolated lets us hop into the
+            // actor without scheduling a Task (and silences the
+            // "synchronous call to main-actor method" warning).
+            MainActor.assumeIsolated {
+                self?.handleInterruption(note)
+            }
         }
     }
 
