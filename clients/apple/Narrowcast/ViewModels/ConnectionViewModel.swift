@@ -356,11 +356,20 @@ final class ConnectionViewModel: ObservableObject {
             // Older Pi builds emit status without a freq field, decoded as 0.
             // Don't let that overwrite the optimistic local value the user
             // just set via tap-to-tune or the freq sheet.
+            let prevFreq = freqHz
+            let prevMode = mode
             if f != 0 {
                 freqHz = f
             }
             if let cc { clientCount = cc }
-            refreshNowPlaying()
+            // Only push lock-screen metadata when freq or mode actually
+            // changed — calling MPNowPlayingInfoCenter on every status
+            // frame (20 Hz) was an XPC roundtrip per call and stalled the
+            // main thread enough to freeze the UI + audio pump in
+            // lockstep, with catch-up bursts every time the IPC unstuck.
+            if freqHz != prevFreq || mode != prevMode {
+                refreshNowPlaying()
+            }
 
         case .loss(let sample):
             lastLoss = sample
