@@ -3,6 +3,10 @@ import MediaPlayer
 import AVFoundation
 import NarrowcastProtocol
 
+#if canImport(UIKit)
+import UIKit
+#endif
+
 // NowPlayingController owns the integration with iOS media surfaces:
 // the lock-screen / Control Center "Now Playing" tile and the system
 // audio-interruption pipeline (phone calls, Siri, other apps stealing
@@ -22,6 +26,19 @@ final class NowPlayingController {
 
     private var registered = false
     private var interruptionObserver: NSObjectProtocol?
+
+    /// Lock-screen artwork. Loaded from the dedicated NowPlayingArt
+    /// imageset — separate from AppIcon so UIImage(named:) actually
+    /// finds it (the AppIcon set is consumed by the asset compiler for
+    /// the home-screen icon and isn't reliably available at runtime).
+    private lazy var artwork: MPMediaItemArtwork? = {
+        #if canImport(UIKit)
+        guard let img = UIImage(named: "NowPlayingArt") else { return nil }
+        return MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+        #else
+        return nil
+        #endif
+    }()
 
     func activate() {
         guard !registered else { return }
@@ -96,13 +113,16 @@ final class NowPlayingController {
     func updateMetadata(stationName: String, freqHz: UInt64, mode: DemodMode, playing: Bool) {
         let mhz = Double(freqHz) / 1_000_000
         let title = String(format: "%.3f MHz · %@", mhz, mode.displayName)
-        let info: [String: Any] = [
+        var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyArtist: stationName,
             MPMediaItemPropertyAlbumTitle: "Narrowcast",
             MPNowPlayingInfoPropertyIsLiveStream: true,
             MPNowPlayingInfoPropertyPlaybackRate: playing ? 1.0 : 0.0,
         ]
+        if let artwork {
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
