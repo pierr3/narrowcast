@@ -310,18 +310,20 @@ type qualityReport struct {
 
 // adaptFFTInterval picks an FFT send interval based on measured loss.
 // Audio is the priority — at high loss we cut FFT bandwidth aggressively.
+// Bands deliberately wide so a single noisy QualityReport (especially on a
+// flaky LAN wifi) doesn't yank the rate around.
 //
-//	 < 2 %  →  full (configured rate, default 10 fps)
-//	 2-10 % →  half (5 fps default)
-//	10-25 % →  1/5  (2 fps default)
-//	 >25 %  →  1/10 (1 fps default)
+//	 < 3 %  →  full (configured rate, default 20 fps)
+//	 3-15 %→  half
+//	15-30 %→  1/5
+//	 >30 % →  1/10
 func adaptFFTInterval(base time.Duration, lossPct byte) time.Duration {
 	switch {
-	case lossPct < 2:
+	case lossPct < 3:
 		return base
-	case lossPct < 10:
+	case lossPct < 15:
 		return base * 2
-	case lossPct < 25:
+	case lossPct < 30:
 		return base * 5
 	default:
 		return base * 10
@@ -334,25 +336,44 @@ func adaptFFTInterval(base time.Duration, lossPct byte) time.Duration {
 // audio. The clean cutout is QUIC's default behavior when datagrams stop
 // flowing, so no extra logic needed at the floor.
 //
-//	 < 2 %  →  configured (default 32 kbps)
-//	 2-5 % →  24 kbps
-//	 >5 %  →  16 kbps  (floor)
+// Bands widened from the original (2/5/floor) split so a single 5% spike on
+// a flaky LAN wifi doesn't dump straight to the floor — the widened middle
+// tier (24 kbps) absorbs short-burst loss while keeping audio intelligible.
+// Combined with the min(current, prev) hysteresis at the call site, single
+// outlier samples can no longer drive a step-down on their own.
+//
+//	  < 3 %  →  configured (default 32 kbps)
+//	  3-12 %→  24 kbps
+//	 12-25 %→  20 kbps
+//	  >25 % →  16 kbps  (floor)
 func adaptOpusBitrate(base int, lossPct byte) int {
 	const floor = 16000
 	if base < floor {
 		base = floor
 	}
 	switch {
-	case lossPct < 2:
+	case lossPct < 3:
 		return base
-	case lossPct < 5:
+	case lossPct < 12:
 		if base > 24000 {
 			return 24000
+		}
+		return base
+	case lossPct < 25:
+		if base > 20000 {
+			return 20000
 		}
 		return base
 	default:
 		return floor
 	}
+}
+
+func minByte(a, b byte) byte {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // adaptOpusLossPerc maps measured loss to the SetPacketLossPerc value the
@@ -563,6 +584,12 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 	// defaults and step down only when QualityReport indicates loss.
 	fftInterval := baseFFTInterval
 	currentBitrate := baseOpusBitrate
+	// Hysteresis: keep the previous report's loss values so a single
+	// outlier sample (a brief wifi blip on an otherwise-clean LAN) can't
+	// drive a step-down on its own. We adapt against min(current, prev),
+	// so degrading requires two consecutive bad reports while recovery
+	// happens immediately on the first good one.
+	var prevAudioLossPct, prevFFTLossPct byte
 
 	// Sequence counters — included in DatagramSeqMark every second. The client
 	// diffs these against its own receive counts to compute loss.
@@ -608,8 +635,19 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 		case qr := <-qualityChan:
 			// Client reported its loss measurement. Adapt FFT rate and Opus
 			// bitrate so the audio path stays viable on a struggling network.
-			newFFTInterval := adaptFFTInterval(baseFFTInterval, qr.fftLossPct)
-			newBitrate := adaptOpusBitrate(baseOpusBitrate, qr.audioLossPct)
+			//
+			// Use min(current, previous) as the stepping signal: an isolated
+			// spike sees a low previous value and gets filtered out, but a
+			// sustained problem keeps both samples high and steps the rate
+			// down. FEC redundancy uses the live (un-filtered) value so the
+			// encoder still allocates protection bits for an active burst.
+			adaptAudioLoss := minByte(qr.audioLossPct, prevAudioLossPct)
+			adaptFFTLoss := minByte(qr.fftLossPct, prevFFTLossPct)
+			prevAudioLossPct = qr.audioLossPct
+			prevFFTLossPct = qr.fftLossPct
+
+			newFFTInterval := adaptFFTInterval(baseFFTInterval, adaptFFTLoss)
+			newBitrate := adaptOpusBitrate(baseOpusBitrate, adaptAudioLoss)
 			lossPerc := adaptOpusLossPerc(qr.audioLossPct)
 
 			if newFFTInterval != fftInterval {
