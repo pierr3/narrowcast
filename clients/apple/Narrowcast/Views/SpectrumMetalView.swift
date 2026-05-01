@@ -33,16 +33,9 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
     var squelchDb: Float = -80
 
     private let commandQueue: MTLCommandQueue
-    private let fillPipeline: MTLRenderPipelineState
     private let linePipeline: MTLRenderPipelineState
 
-    // Triangle-strip vertex buffer for the filled spectrum body. Pre-sized
-    // for 1024 bins * 2 verts (baseline + top) — server's default FFT size.
-    private var fillVertexBuffer: MTLBuffer
-    private var fillVertexCount: Int = 0
-
-    // Line strip on top of the fill — the bright cyan stroke marking the
-    // spectrum curve. One vertex per bin.
+    // Top edge line strip — the spectrum curve itself. One vertex per bin.
     private var topLineBuffer: MTLBuffer
     private var topLineCount: Int = 0
 
@@ -66,7 +59,6 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         }
         guard
             let vfn = lib.makeFunction(name: "spectrum_vertex"),
-            let ffn = lib.makeFunction(name: "spectrum_fill_fragment"),
             let lfn = lib.makeFunction(name: "line_fragment")
         else {
             fatalError("Spectrum shaders missing from Metal library")
@@ -75,23 +67,15 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         self.commandQueue = q
 
         let format = MTLPixelFormat.bgra8Unorm
-
-        let fillDesc = MTLRenderPipelineDescriptor()
-        fillDesc.vertexFunction = vfn
-        fillDesc.fragmentFunction = ffn
-        fillDesc.colorAttachments[0].pixelFormat = format
-        fillDesc.colorAttachments[0].isBlendingEnabled = true
-        fillDesc.colorAttachments[0].rgbBlendOperation = .add
-        fillDesc.colorAttachments[0].alphaBlendOperation = .add
-        fillDesc.colorAttachments[0].sourceRGBBlendFactor = .one
-        fillDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
-        fillDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        fillDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        self.fillPipeline = (try? dev.makeRenderPipelineState(descriptor: fillDesc))!
+        // 4x MSAA gives the line strip clean anti-aliased edges instead
+        // of staircased pixels. Each frame is barely 1024 line segments;
+        // the GPU cost is negligible vs the polish gained.
+        let sampleCount = 4
 
         let lineDesc = MTLRenderPipelineDescriptor()
         lineDesc.vertexFunction = vfn
         lineDesc.fragmentFunction = lfn
+        lineDesc.rasterSampleCount = sampleCount
         lineDesc.colorAttachments[0].pixelFormat = format
         lineDesc.colorAttachments[0].isBlendingEnabled = true
         lineDesc.colorAttachments[0].rgbBlendOperation = .add
@@ -102,9 +86,6 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         lineDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         self.linePipeline = (try? dev.makeRenderPipelineState(descriptor: lineDesc))!
 
-        // 4096 bins * 2 verts * float2 = headroom for any FFT size we ship.
-        let cap = 4096 * 2 * MemoryLayout<SIMD2<Float>>.stride
-        self.fillVertexBuffer = dev.makeBuffer(length: cap, options: .storageModeShared)!
         self.topLineBuffer = dev.makeBuffer(length: 4096 * MemoryLayout<SIMD2<Float>>.stride, options: .storageModeShared)!
         self.peakLineBuffer = dev.makeBuffer(length: 4096 * MemoryLayout<SIMD2<Float>>.stride, options: .storageModeShared)!
         self.decorBuffer = dev.makeBuffer(length: 64 * MemoryLayout<SIMD2<Float>>.stride, options: .storageModeShared)!
@@ -112,6 +93,7 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         super.init(frame: .zero, device: dev)
 
         self.colorPixelFormat = format
+        self.sampleCount = sampleCount
         self.preferredFramesPerSecond = 60
         self.isPaused = false
         self.enableSetNeedsDisplay = false
@@ -152,19 +134,7 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         // labels. yScale < 1.0 leaves a transparent strip up top.
         let yScale: Float = 0.92
 
-        // --- Fill triangle strip ---
-        do {
-            let ptr = fillVertexBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: n * 2)
-            for i in 0..<n {
-                let x = Float(i) / Float(n - 1)
-                let y = snap.smooth[i] * yScale
-                ptr[i * 2 + 0] = SIMD2<Float>(x, 0)
-                ptr[i * 2 + 1] = SIMD2<Float>(x, y)
-            }
-            fillVertexCount = n * 2
-        }
-
-        // --- Top edge line strip ---
+        // --- Spectrum line ---
         do {
             let ptr = topLineBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: n)
             for i in 0..<n {
@@ -192,19 +162,15 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
             lastSquelchDb = squelchDb
         }
 
-        // --- Draw fill ---
-        enc.setRenderPipelineState(fillPipeline)
-        enc.setVertexBuffer(fillVertexBuffer, offset: 0, index: 0)
-        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: fillVertexCount)
-
-        // --- Draw peak hold (mid gray, reads on white) ---
         enc.setRenderPipelineState(linePipeline)
+
+        // --- Peak hold (faint gray, drawn first so the live line sits on top) ---
         enc.setVertexBuffer(peakLineBuffer, offset: 0, index: 0)
-        var peakColor = SIMD4<Float>(0.35, 0.40, 0.50, 0.55)
+        var peakColor = SIMD4<Float>(0.40, 0.45, 0.55, 0.45)
         enc.setFragmentBytes(&peakColor, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
         enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: peakLineCount)
 
-        // --- Draw top edge (deep blue stroke for definition on white) ---
+        // --- Spectrum line (deep blue, sharp) ---
         enc.setVertexBuffer(topLineBuffer, offset: 0, index: 0)
         var topColor = SIMD4<Float>(0.05, 0.35, 0.80, 1.0)
         enc.setFragmentBytes(&topColor, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
