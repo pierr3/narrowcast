@@ -18,9 +18,7 @@ struct ListenView: View {
             sMeter
             squelch
             gainControl
-            // Waterfall disabled — 1024-bin Canvas redraw at 10 fps pegged
-            // the main thread. Re-enable behind a Metal texture / CGImage
-            // row update.
+            spectrumPanel
             Spacer(minLength: 0)
             playStop
         }
@@ -176,6 +174,38 @@ struct ListenView: View {
             let offset = (Double(frac) - 0.5) * sr
             let newHz = max(info.minHz, min(info.maxHz, UInt64(Int64(vm.freqHz) + Int64(offset))))
             vm.setFrequency(newHz)
+        }
+    }
+
+    private var spectrumPanel: some View {
+        // Spectrum sits below all controls. Renders FFT bins centered on
+        // tunedFreq, span = SDR sample rate. Edge labels use the
+        // server-reported sampleRate so the values stay correct if the
+        // SDR rate ever changes.
+        let span = Double(vm.serverInfo?.sampleRate ?? 2_400_000)
+        let centerMhz = Double(vm.freqHz) / 1_000_000
+        let halfSpanMhz = span / 2_000_000
+        return VStack(spacing: 4) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.black.opacity(0.65))
+                SpectrumView(store: vm.spectrumStore, squelchDb: vm.squelchDb)
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 2)
+            }
+            .frame(height: 130)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            HStack {
+                Text(String(format: "%.3f", centerMhz - halfSpanMhz))
+                Spacer()
+                Text(String(format: "%.3f MHz", centerMhz))
+                Spacer()
+                Text(String(format: "%.3f", centerMhz + halfSpanMhz))
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
         }
     }
 

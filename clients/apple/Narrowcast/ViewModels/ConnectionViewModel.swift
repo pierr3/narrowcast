@@ -42,6 +42,10 @@ final class ConnectionViewModel: ObservableObject {
     private var connectedServerName: String = ""
     private let nowPlaying = NowPlayingController()
 
+    // Shared with SpectrumView. Pump feeds bins on the background context;
+    // the Metal renderer pulls a snapshot per frame.
+    let spectrumStore = SpectrumStore()
+
     // Waterfall data is only published when a consumer asks for it. SwiftUI
     // would otherwise redraw on every 10 Hz FFT regardless of visibility.
     @Published var waterfallFrames: [[UInt8]] = []
@@ -261,17 +265,18 @@ final class ConnectionViewModel: ObservableObject {
                                           holder: AudioPipelineHolder) async {
         // Loop runs on a background context (not @MainActor). Audio takes
         // the hot path straight to the AudioPipeline queue with no actor
-        // hop. FFT is dropped at the case head while waterfall is disabled
-        // (no MainActor.run roundtrip just to read a flag); when waterfall
-        // is reintroduced behind a perf-tuned renderer this case will
-        // route to it directly.
+        // hop. FFT is fed straight to SpectrumStore (lock-protected) so
+        // the Metal renderer can snapshot it per frame; no MainActor hop
+        // on the FFT hot path either, since the spectrum view doesn't go
+        // through SwiftUI redraws.
+        let spectrum = self.spectrumStore
         for await event in await client.events {
             switch event {
             case .audio(let opus):
                 holder.feed(opus)
 
-            case .fft:
-                continue
+            case .fft(let bins):
+                spectrum.update(bins: bins)
 
             default:
                 await MainActor.run { self.handle(event) }
