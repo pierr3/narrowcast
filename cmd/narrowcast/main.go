@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof on http.DefaultServeMux
 	"os/signal"
 	"sync"
 	"sync/atomic"
@@ -36,6 +38,23 @@ func main() {
 }
 
 func run(ctx context.Context, cfg *config.Config) error {
+	// Fail fast on a configuration that would only show up as subtly wrong
+	// audio at runtime (see config.Validate).
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	if cfg.PProfAddr != "" {
+		srv := &http.Server{Addr: cfg.PProfAddr, Handler: http.DefaultServeMux}
+		go func() {
+			log.Printf("[pprof] listening on %s", cfg.PProfAddr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("[pprof] %v", err)
+			}
+		}()
+		defer srv.Close()
+	}
+
 	// Open SDR (real or simulated)
 	var dev sdr.SDRDevice
 	if cfg.Simulate {
@@ -56,38 +75,14 @@ func run(ctx context.Context, cfg *config.Config) error {
 	}
 	defer dev.Close()
 
-	// Shared state protected by mutex
-	state := &serverState{
-		cfg:       cfg,
-		dev:       dev,
-		mode:      cfg.DemodMode,
-		freqHz:    cfg.FrequencyHz,
-		squelchDb: cfg.SquelchDBm,
-	}
+	state := newServerState(ctx, cfg, dev)
 
-	// IQ sample fan-out: SDR callback pushes to a channel, pipeline goroutine consumes
-	iqChan := make(chan []byte, 16)
-
-	// Drop counter: SDR callback increments when iqChan is full. The pipeline
-	// observes increases and resets DSP state — continuing to filter with
-	// stale FIR/IIR history after a buffer gap produces audible warbling.
-	state.dropCount = &atomic.Uint64{}
-
-	// Start SDR async read in a goroutine
+	// Start SDR async read in a goroutine.
 	go func() {
-		bufSize := cfg.SampleRate / 10 * 2 // ~100ms of CU8 data
-		err := dev.ReadAsync(func(buf []byte) {
-			// Copy buffer since the SDR reuses it
-			cp := make([]byte, len(buf))
-			copy(cp, buf)
-			select {
-			case iqChan <- cp:
-			default:
-				// Pipeline can't keep up — drop and signal so it resets state.
-				state.dropCount.Add(1)
-			}
-		}, 12, bufSize)
-		if err != nil {
+		bufSize := iqBufBytes(cfg.SampleRate)
+		log.Printf("[sdr] async read: %d buffers of %d B (%.0f ms per block)",
+			iqBufCount, bufSize, float64(bufSize)/2/float64(cfg.SampleRate)*1000)
+		if err := dev.ReadAsync(state.onIQ, iqBufCount, bufSize); err != nil {
 			log.Printf("[sdr] read async error: %v", err)
 		}
 	}()
@@ -97,75 +92,278 @@ func run(ctx context.Context, cfg *config.Config) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	srv, err := protocol.NewServer(addr, cfg.CertFile, cfg.KeyFile,
 		func(clientCtx context.Context, conn quic.Connection) {
-			handleClient(clientCtx, conn, state, iqChan)
+			handleClient(clientCtx, conn, state)
 		})
 	if err != nil {
 		return fmt.Errorf("server: %w", err)
 	}
 	defer srv.Close()
 
-	log.Printf("[narrowcast] server starting on %s (freq=%d Hz, mode=%s)",
-		addr, cfg.FrequencyHz, cfg.DemodMode)
+	log.Printf("[narrowcast] server starting on %s (freq=%d Hz, mode=%s, rate=%d)",
+		addr, cfg.FrequencyHz, cfg.DemodMode, cfg.SampleRate)
 
 	return srv.Serve(ctx)
 }
 
-// serverState holds mutable SDR state shared between clients and the pipeline.
+const (
+	// iqBufCount is how many USB transfer buffers librtlsdr keeps in flight.
+	iqBufCount = 12
+	// iqChanDepth bounds how much IQ can queue ahead of the pipeline. Eight
+	// 20 ms blocks is 160 ms — enough to absorb a GC pause or a scheduling
+	// hiccup, short enough that a real overload is reported as a drop (and
+	// handled with a DSP reset) instead of quietly becoming latency.
+	iqChanDepth = 8
+	// iqBufPoolDepth sizes the recycled-buffer free list. Slightly larger than
+	// iqChanDepth so a buffer is almost always available without allocating.
+	iqBufPoolDepth = iqChanDepth + 4
+)
+
+// iqBufBytes picks the async read buffer size: ~20 ms of CU8 at the configured
+// rate, rounded down to a multiple of 512.
+//
+// The multiple of 512 is not cosmetic: librtlsdr replaces any buf_len that
+// isn't one with its own 256 KiB default, which at 960 kS/s is a 137 ms block.
+// The previous code asked for sampleRate/10*2 and silently got that default.
+func iqBufBytes(sampleRate int) int {
+	const blockMs = 20
+	b := sampleRate * 2 * blockMs / 1000
+	b -= b % 512
+	if b < 512 {
+		b = 512
+	}
+	return b
+}
+
+// serverState holds the SDR, the shared DSP pipeline and the connected
+// subscribers.
+//
+// One pipeline serves every subscriber. It used to be one pipeline per client,
+// all of them reading the same iqChan, which meant two connections stole
+// alternating IQ blocks from each other — both got half the sample stream and
+// both produced broken audio — while also doing the DSP work twice. On the
+// normal relay path there is only ever one connection so it went unnoticed,
+// except during the overlap window of an uplink reconnect.
 type serverState struct {
-	cfg       *config.Config
-	dev       sdr.SDRDevice
+	cfg *config.Config
+	dev sdr.SDRDevice
+	// ctx is the server's lifetime. The pipeline is shared, so it must not be
+	// tied to whichever client happened to start it.
+	ctx context.Context
+
 	mu        sync.RWMutex
 	mode      protocol.DemodMode
 	freqHz    uint64
 	squelchDb float32
 
+	// welcome is immutable after construction (it only reports static limits).
+	welcome []byte
+
+	subsMu sync.RWMutex
+	subs   map[string]*protocol.Writer
+
+	iqChan  chan []byte
+	bufPool chan []byte
+	// iqWanted gates the SDR callback. With no listeners there is nobody to
+	// send to, so copying every buffer out of the USB ring is pure idle heat.
+	iqWanted atomic.Bool
 	// dropCount is incremented by the SDR callback whenever iqChan is full.
-	// The pipeline tracks the last observed value and resets DSP state when
-	// it increases, so we don't keep filtering across a discontinuity.
-	dropCount *atomic.Uint64
+	// The pipeline tracks the last observed value and resets DSP state when it
+	// increases, so we don't keep filtering across a discontinuity.
+	dropCount atomic.Uint64
+
+	// Pipeline control. Buffered so command handling never blocks on the
+	// pipeline, and drained at pipeline start so a restart doesn't act on
+	// commands from a previous run.
+	modeChan    chan protocol.DemodMode
+	flushChan   chan struct{}
+	qualityChan chan qualityReport
+
+	// Pipeline lifecycle, reference-counted over connections that sent Start.
+	pipeMu    sync.Mutex
+	pipeStop  chan struct{}
+	pipeWg    sync.WaitGroup
+	listeners int
 }
 
-func handleClient(ctx context.Context, conn quic.Connection, state *serverState, iqChan <-chan []byte) {
-	remote := conn.RemoteAddr().String()
-
-	// --- Command loop + streaming ---
-	// All commands are sent as datagrams: [uint8 type][payload...]
-	// (Same format as data datagrams, but with command type bytes 0x10-0x31)
-	streaming := false
-	stopStreaming := make(chan struct{})
-	modeChan := make(chan protocol.DemodMode, 1)
-	// flushChan signals the pipeline to drain stale IQ buffers and reset DSP
-	// state — used after a hardware retune so the listener doesn't hear a
-	// transient pop while old samples drain through the filters.
-	flushChan := make(chan struct{}, 1)
-	// qualityChan delivers client-reported loss measurements (0-100 %) so the
-	// pipeline can throttle FFT rate and reduce Opus bitrate. Not blocking
-	// audio path: best-effort drop on full.
-	qualityChan := make(chan qualityReport, 4)
-	var streamWg sync.WaitGroup
-
-	defer func() {
-		if streaming {
-			close(stopStreaming)
-			streamWg.Wait()
-		}
-	}()
-
-	// Send Welcome as a datagram immediately
-	state.mu.RLock()
+func newServerState(ctx context.Context, cfg *config.Config, dev sdr.SDRDevice) *serverState {
 	welcome := []byte{protocol.CmdWelcome, protocol.ProtoVersion}
 	welcome = append(welcome, protocol.EncodeUint64(24_000_000)...)    // min freq
 	welcome = append(welcome, protocol.EncodeUint64(1_766_000_000)...) // max freq
-	welcome = append(welcome, protocol.EncodeFloat32(float32(state.cfg.SampleRate))...)
-	state.mu.RUnlock()
-	if err := conn.SendDatagram(welcome); err != nil {
-		log.Printf("[client %s] welcome send: %v", remote, err)
+	welcome = append(welcome, protocol.EncodeFloat32(float32(cfg.SampleRate))...)
+
+	return &serverState{
+		cfg:         cfg,
+		dev:         dev,
+		ctx:         ctx,
+		mode:        cfg.DemodMode,
+		freqHz:      cfg.FrequencyHz,
+		squelchDb:   cfg.SquelchDBm,
+		welcome:     welcome,
+		subs:        make(map[string]*protocol.Writer),
+		iqChan:      make(chan []byte, iqChanDepth),
+		bufPool:     make(chan []byte, iqBufPoolDepth),
+		modeChan:    make(chan protocol.DemodMode, 1),
+		flushChan:   make(chan struct{}, 1),
+		qualityChan: make(chan qualityReport, 4),
+	}
+}
+
+// onIQ is the SDR read callback. It runs on librtlsdr's USB thread, so it must
+// never block: the buffer it is handed is reused as soon as it returns.
+func (s *serverState) onIQ(buf []byte) {
+	if !s.iqWanted.Load() {
 		return
 	}
+	cp := s.takeBuf(len(buf))
+	copy(cp, buf)
+	select {
+	case s.iqChan <- cp:
+	default:
+		// Pipeline can't keep up — drop and signal so it resets DSP state.
+		s.dropCount.Add(1)
+		s.recycleBuf(cp)
+	}
+}
+
+func (s *serverState) takeBuf(n int) []byte {
+	select {
+	case b := <-s.bufPool:
+		if cap(b) >= n {
+			return b[:n]
+		}
+	default:
+	}
+	return make([]byte, n)
+}
+
+func (s *serverState) recycleBuf(b []byte) {
+	select {
+	case s.bufPool <- b[:cap(b)]:
+	default: // pool full; let the GC have it
+	}
+}
+
+func (s *serverState) drainIQ() int {
+	drained := 0
+	for {
+		select {
+		case b := <-s.iqChan:
+			s.recycleBuf(b)
+			drained++
+		default:
+			return drained
+		}
+	}
+}
+
+func (s *serverState) addSubscriber(id string, w *protocol.Writer) {
+	s.subsMu.Lock()
+	s.subs[id] = w
+	s.subsMu.Unlock()
+}
+
+func (s *serverState) removeSubscriber(id string) {
+	s.subsMu.Lock()
+	delete(s.subs, id)
+	s.subsMu.Unlock()
+}
+
+// broadcast hands a datagram to every subscriber.
+//
+// Holding the read lock across the sends is safe precisely because
+// protocol.Writer.Send never blocks — it queues or drops. The same backing
+// slice reaching several writers is also fine: nobody mutates it, and quic-go
+// copies the payload into the datagram frame.
+func (s *serverState) broadcast(dgram []byte) {
+	s.subsMu.RLock()
+	defer s.subsMu.RUnlock()
+	for _, w := range s.subs {
+		w.Send(dgram)
+	}
+}
+
+// addListener registers interest in the audio stream, starting the shared
+// pipeline on the first one.
+func (s *serverState) addListener() {
+	s.pipeMu.Lock()
+	defer s.pipeMu.Unlock()
+
+	s.listeners++
+	if s.listeners > 1 {
+		return
+	}
+
+	stop := make(chan struct{})
+	s.pipeStop = stop
+	s.iqWanted.Store(true)
+	s.pipeWg.Add(1)
+	go func() {
+		defer s.pipeWg.Done()
+		runPipeline(s, stop)
+	}()
+	log.Printf("[pipeline] started (1 listener)")
+}
+
+// removeListener drops interest, stopping the pipeline and the IQ copy path
+// when the last listener goes away.
+//
+// pipeMu is held across pipeWg.Wait so a reconnect arriving mid-teardown can't
+// start a second pipeline alongside the one still draining. The pipeline never
+// takes pipeMu, so this cannot deadlock.
+func (s *serverState) removeListener() {
+	s.pipeMu.Lock()
+	defer s.pipeMu.Unlock()
+
+	if s.listeners == 0 {
+		return
+	}
+	s.listeners--
+	if s.listeners > 0 {
+		return
+	}
+
+	stop := s.pipeStop
+	s.pipeStop = nil
+	s.iqWanted.Store(false)
+	if stop != nil {
+		close(stop)
+	}
+	s.pipeWg.Wait()
+	s.drainIQ()
+	log.Printf("[pipeline] stopped (no listeners)")
+}
+
+func handleClient(ctx context.Context, conn quic.Connection, state *serverState) {
+	remote := conn.RemoteAddr().String()
+
+	// All traffic is datagrams: [uint8 type][payload...]. Sends go through a
+	// Writer so a congested link can never block this goroutine or, worse, the
+	// shared pipeline behind it.
+	w := protocol.NewWriter(conn)
+	defer func() {
+		if drops, errs := w.Stats(); drops > 0 || errs > 0 {
+			log.Printf("[client %s] writer shed %d datagrams, %d send errors", remote, drops, errs)
+		}
+		w.Close()
+	}()
+
+	state.addSubscriber(remote, w)
+	defer state.removeSubscriber(remote)
+
+	// listening tracks whether this connection has an outstanding Start. The
+	// relay multiplexes every phone onto one connection, so repeated Starts
+	// from different phones must count once and a single Stop must end it.
+	listening := false
+	defer func() {
+		if listening {
+			state.removeListener()
+		}
+	}()
+
+	w.Send(state.welcome)
 	log.Printf("[client %s] sent Welcome datagram", remote)
 
 	for {
-		// Receive command datagrams
 		dgram, err := conn.ReceiveDatagram(ctx)
 		if err != nil {
 			log.Printf("[client %s] recv datagram: %v", remote, err)
@@ -183,11 +381,9 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			if len(payload) >= 1 {
 				log.Printf("[client %s] Hello v%d", remote, payload[0])
 			}
-			// Resend Welcome on every Hello (needed for relay: the initial
-			// Welcome may have been sent before any client was connected)
-			if err := conn.SendDatagram(welcome); err != nil {
-				log.Printf("[client %s] welcome resend: %v", remote, err)
-			}
+			// Resend Welcome on every Hello (needed for the relay: the initial
+			// Welcome may have been sent before any client was connected).
+			w.Send(state.welcome)
 
 		case protocol.CmdSetFrequency:
 			if len(payload) < 8 {
@@ -202,10 +398,7 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			}
 			// Tell the pipeline to drain stale IQ and reset DSP state so the
 			// retune is heard as a clean cut, not a swept artifact.
-			select {
-			case flushChan <- struct{}{}:
-			default:
-			}
+			notify(state.flushChan)
 			log.Printf("[client %s] freq → %d Hz", remote, hz)
 
 		case protocol.CmdSetMode:
@@ -216,15 +409,7 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			state.mu.Lock()
 			state.mode = mode
 			state.mu.Unlock()
-			select {
-			case modeChan <- mode:
-			default:
-				select {
-				case <-modeChan:
-				default:
-				}
-				modeChan <- mode
-			}
+			replace(state.modeChan, mode)
 			log.Printf("[client %s] mode → %s", remote, mode)
 
 		case protocol.CmdSetSquelch:
@@ -254,41 +439,65 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState,
 			if len(payload) < 4 {
 				continue
 			}
-			qr := qualityReport{
+			replace(state.qualityChan, qualityReport{
 				audioLossPct: payload[0],
 				fftLossPct:   payload[1],
-			}
-			select {
-			case qualityChan <- qr:
-			default:
-				// Drop oldest, push newest — staleness is worse than gap.
-				select {
-				case <-qualityChan:
-				default:
-				}
-				qualityChan <- qr
-			}
+			})
 
 		case protocol.CmdStart:
-			if streaming {
+			if listening {
 				continue
 			}
-			streaming = true
-			stopStreaming = make(chan struct{})
-			streamWg.Add(1)
-			go func() {
-				defer streamWg.Done()
-				runPipeline(ctx, conn, state, iqChan, stopStreaming, modeChan, flushChan, qualityChan)
-			}()
+			listening = true
+			state.addListener()
 			log.Printf("[client %s] streaming started", remote)
 
 		case protocol.CmdStop:
-			if streaming {
-				close(stopStreaming)
-				streamWg.Wait()
-				streaming = false
-				log.Printf("[client %s] streaming stopped", remote)
+			if !listening {
+				continue
 			}
+			listening = false
+			state.removeListener()
+			log.Printf("[client %s] streaming stopped", remote)
+		}
+	}
+}
+
+// notify posts a signal on a capacity-1 channel, coalescing with any pending
+// one. Never blocks.
+func notify(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// replace posts v on a buffered channel, discarding an older queued value if
+// the channel is full. Never blocks: for tuning and quality reports staleness
+// is worse than a gap, so the newest value wins.
+func replace[T any](ch chan T, v T) {
+	select {
+	case ch <- v:
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- v:
+	default:
+	}
+}
+
+// drain empties a buffered channel.
+func drain[T any](ch chan T) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
 		}
 	}
 }
@@ -313,7 +522,7 @@ type qualityReport struct {
 // Bands deliberately wide so a single noisy QualityReport (especially on a
 // flaky LAN wifi) doesn't yank the rate around.
 //
-//	 < 3 %  →  full (configured rate, default 20 fps)
+//	 < 3 %  →  full (configured rate)
 //	 3-15 %→  half
 //	15-30 %→  1/5
 //	 >30 % →  1/10
@@ -342,10 +551,10 @@ func adaptFFTInterval(base time.Duration, lossPct byte) time.Duration {
 // Combined with the min(current, prev) hysteresis at the call site, single
 // outlier samples can no longer drive a step-down on their own.
 //
-//	  < 3 %  →  configured (default 32 kbps)
-//	  3-12 %→  24 kbps
-//	 12-25 %→  20 kbps
-//	  >25 % →  16 kbps  (floor)
+//	 < 3 %  →  configured (default 32 kbps)
+//	 3-12 %→  24 kbps
+//	12-25 %→  20 kbps
+//	 >25 % →  16 kbps  (floor)
 func adaptOpusBitrate(base int, lossPct byte) int {
 	const floor = 16000
 	if base < floor {
@@ -390,7 +599,10 @@ func adaptOpusLossPerc(lossPct byte) int {
 	return v
 }
 
-// buildDSPChain constructs the DSP objects for a given demod mode.
+// dspChain holds the DSP objects for one demod mode, plus the scratch buffers
+// the pipeline reuses across blocks. Every stage that emits a slice owns and
+// recycles it (see the pkg/dsp package comment), so a steady-state block costs
+// no allocations at all.
 type dspChain struct {
 	xlat        *dsp.XlatingFilter
 	fmDemod     *dsp.FMDemodulator // non-nil for NFM/WFM
@@ -404,6 +616,12 @@ type dspChain struct {
 	gain        gainStage          // AGC (FM) or hang-time AudioAGC (AM)
 	opusEnc     *audio.OpusEncoder
 	audioRate   int
+
+	// Scratch, reused every block.
+	iq       []complex128 // CU8 → complex
+	hann     *dsp.HannWindow
+	fftFrame []complex128 // windowed copy, FFT works in place
+	fftBins  []byte       // pooled magnitude bins
 }
 
 // Reset clears every stateful stage in the chain. Called after a hardware
@@ -435,13 +653,18 @@ func (c *dspChain) Reset() {
 	if c.gain != nil {
 		c.gain.Reset()
 	}
+	if c.opusEnc != nil {
+		c.opusEnc.Reset()
+	}
 }
 
-func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*dspChain, error) {
+func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int) (*dspChain, error) {
+	sampleRate := cfg.SampleRate
 	channelBW := mode.ChannelBandwidth()
 	audioRate := mode.AudioRate()
 
-	// Total decimation must be exact: sampleRate / totalDecim = audioRate
+	// Total decimation is exact: config.Validate guarantees the sample rate is
+	// a multiple of every mode's audio rate.
 	totalDecim := sampleRate / audioRate
 
 	// Minimum xlating decimation to satisfy Nyquist for the channel bandwidth
@@ -481,8 +704,8 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		audioDecimF = dsp.NewRealFIRDecimator(aaTaps, audioDecim)
 	}
 
-	log.Printf("[dsp] mode=%s xlatDecim=%d audioDecim=%d decimatedRate=%.0f audioRate=%d",
-		mode, xlatDecim, audioDecim, decimatedRate, audioRate)
+	log.Printf("[dsp] mode=%s xlatDecim=%d audioDecim=%d taps=%d decimatedRate=%.0f audioRate=%d",
+		mode, xlatDecim, audioDecim, numTaps, decimatedRate, audioRate)
 
 	var demodFn func([]complex128) []float64
 	var deemph *dsp.DeEmphasis
@@ -505,7 +728,7 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 
 	// AM voice cleanup: bandpass 400-3000 Hz
 	// No noise gate for AM — squelch handles muting between transmissions,
-	// and the gate causes crackle by chattering on AGC-amplified noise.
+	// and a gate causes crackle by chattering on AGC-amplified noise.
 	var voiceHPF *dsp.HighPassIIR
 	var voiceLPF *dsp.RealFIRFilter
 	if mode == protocol.ModeAM {
@@ -513,8 +736,8 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		voiceHPF = dsp.NewHighPassIIR(400, float64(audioRate))
 		// Low-pass at 3000 Hz to remove high-frequency noise
 		lpfNumTaps := 65
-		lpfTaps := dsp.NewLowPassFIR(3000, float64(audioRate), lpfNumTaps)
-		voiceLPF = dsp.NewRealFIRDecimator(lpfTaps, 1) // decim=1, just filtering
+		voiceTaps := dsp.NewLowPassFIR(3000, float64(audioRate), lpfNumTaps)
+		voiceLPF = dsp.NewRealFIRDecimator(voiceTaps, 1) // decim=1, just filtering
 		log.Printf("[dsp] AM voice cleanup: bandpass 400-3000 Hz")
 	}
 
@@ -556,24 +779,35 @@ func buildDSPChain(mode protocol.DemodMode, sampleRate int, opusBitrate int) (*d
 		gain:        gain,
 		opusEnc:     opusEnc,
 		audioRate:   audioRate,
+		hann:        dsp.NewHannWindow(cfg.FFTSize),
+		fftFrame:    make([]complex128, cfg.FFTSize),
+		fftBins:     make([]byte, cfg.FFTBins),
 	}, nil
 }
 
-// runPipeline reads IQ data, demodulates, encodes, and sends datagrams.
-func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, iqChan <-chan []byte, stop <-chan struct{}, modeChan <-chan protocol.DemodMode, flushChan <-chan struct{}, qualityChan <-chan qualityReport) {
+// runPipeline reads IQ data, demodulates, encodes, and broadcasts datagrams to
+// every subscriber. One instance runs while at least one listener is present.
+func runPipeline(state *serverState, stop <-chan struct{}) {
+	cfg := state.cfg
 	state.mu.RLock()
 	mode := state.mode
-	sampleRate := state.cfg.SampleRate
-	fftSize := state.cfg.FFTSize
-	baseFFTInterval := time.Second / time.Duration(state.cfg.FFTRate)
-	baseOpusBitrate := state.cfg.OpusBitrate
 	state.mu.RUnlock()
 
-	chain, err := buildDSPChain(mode, sampleRate, baseOpusBitrate)
+	fftSize := cfg.FFTSize
+	baseFFTInterval := time.Second / time.Duration(cfg.FFTRate)
+	baseOpusBitrate := cfg.OpusBitrate
+
+	chain, err := buildDSPChain(mode, cfg, baseOpusBitrate)
 	if err != nil {
 		log.Printf("[pipeline] dsp chain error: %v", err)
 		return
 	}
+
+	// Commands queued while the pipeline was stopped describe a world we
+	// already read from state above, so start from a clean slate.
+	drain(state.modeChan)
+	drain(state.flushChan)
+	drain(state.qualityChan)
 
 	// Track SDR drop count to detect IQ-buffer gaps. On increase we reset all
 	// DSP state and skip the next block to avoid filtering across a
@@ -584,55 +818,63 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 	// defaults and step down only when QualityReport indicates loss.
 	fftInterval := baseFFTInterval
 	currentBitrate := baseOpusBitrate
-	// Hysteresis: keep the previous report's loss values so a single
-	// outlier sample (a brief wifi blip on an otherwise-clean LAN) can't
-	// drive a step-down on its own. We adapt against min(current, prev),
-	// so degrading requires two consecutive bad reports while recovery
-	// happens immediately on the first good one.
+	// Hysteresis: keep the previous report's loss values so a single outlier
+	// sample (a brief wifi blip on an otherwise-clean LAN) can't drive a
+	// step-down on its own. We adapt against min(current, prev), so degrading
+	// requires two consecutive bad reports while recovery happens immediately
+	// on the first good one.
 	var prevAudioLossPct, prevFFTLossPct byte
 
 	// Sequence counters — included in DatagramSeqMark every second. The client
-	// diffs these against its own receive counts to compute loss.
+	// diffs these against its own receive counts to compute loss. They count
+	// datagrams handed to the Writer, including any it later sheds, which is
+	// what we want: locally dropped datagrams are real loss from the client's
+	// point of view and should feed the adaptation loop.
 	var audioSent, fftSent, statusSent uint32
+	// audioSeq tags each Opus frame so the client can tell a lost packet from
+	// silence and spend the in-band FEC. Wraps at 2^16 by design.
+	var audioSeq uint16
 	const seqMarkInterval = 1 * time.Second
 	lastSeqMark := time.Now()
 
-	// FFT state
-	fftBuf := make([]complex128, 0, fftSize)
 	lastFFT := time.Now()
 
-	// Status state (send ~4 times per second)
+	// 10 Hz status. Payload is ~18-19 B (incl. the relay's client-count
+	// append), so this is ~190 B/s. The client animates between samples, so a
+	// faster rate buys no perceived smoothness — it only costs the client a
+	// SwiftUI invalidation per frame, which is main-thread work on a phone.
 	lastStatus := time.Now()
-	// 20 Hz status. Status payload is ~18-19 B (incl. relay's client-count
-	// append), so 20 Hz = ~380 B/s — well inside the 14 KB/s budget. Client
-	// SwiftUI animates between samples for visually smooth meter motion, so
-	// going higher (e.g. 30+ Hz) gives diminishing returns on perception.
-	statusInterval := 50 * time.Millisecond
+	const statusInterval = 100 * time.Millisecond
 	var signalPowerDb float32 = -120
+
+	// squelchOpen tracks the gate so the Opus encoder can be reset exactly
+	// once on close: without that, samples buffered before the gap get
+	// prepended to the next transmission as a click.
+	squelchOpen := true
+
+	fftTooSmallLogged := false
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-state.ctx.Done():
 			return
 		case <-stop:
 			return
-		case newMode := <-modeChan:
+
+		case newMode := <-state.modeChan:
 			if newMode == mode {
 				continue
 			}
-			newChain, err := buildDSPChain(newMode, sampleRate, baseOpusBitrate)
+			newChain, err := buildDSPChain(newMode, cfg, currentBitrate)
 			if err != nil {
 				log.Printf("[pipeline] rebuild dsp chain: %v", err)
 				continue
 			}
 			chain = newChain
 			mode = newMode
-			fftBuf = fftBuf[:0]
-			// Re-apply current adaptive Opus settings to the freshly built encoder.
-			_ = chain.opusEnc.SetBitrate(currentBitrate)
 			log.Printf("[pipeline] DSP chain rebuilt for mode %s", mode)
 
-		case qr := <-qualityChan:
+		case qr := <-state.qualityChan:
 			// Client reported its loss measurement. Adapt FFT rate and Opus
 			// bitrate so the audio path stays viable on a struggling network.
 			//
@@ -668,28 +910,18 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				log.Printf("[adapt] SetPacketLossPerc %d: %v", lossPerc, err)
 			}
 
-		case <-flushChan:
+		case <-state.flushChan:
 			// Hardware was retuned. Drop any IQ buffered before the retune
-			// (they're at the OLD frequency) and reset every stateful DSP
-			// stage so post-retune audio doesn't carry pre-retune transient.
-			drained := 0
-		drainLoop:
-			for {
-				select {
-				case <-iqChan:
-					drained++
-				default:
-					break drainLoop
-				}
-			}
+			// (it's at the OLD frequency) and reset every stateful DSP stage
+			// so post-retune audio doesn't carry a pre-retune transient.
+			drained := state.drainIQ()
 			chain.Reset()
-			fftBuf = fftBuf[:0]
-			// Sync the drop-counter baseline: drops we just discarded shouldn't
-			// trigger another reset on the next block.
+			// Sync the drop-counter baseline: drops we just discarded
+			// shouldn't trigger another reset on the next block.
 			lastDrops = state.dropCount.Load()
 			log.Printf("[pipeline] flush: drained %d stale IQ buffers, DSP reset", drained)
 
-		case rawBuf, ok := <-iqChan:
+		case rawBuf, ok := <-state.iqChan:
 			if !ok {
 				return
 			}
@@ -701,38 +933,44 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				dropped := d - lastDrops
 				lastDrops = d
 				chain.Reset()
+				state.recycleBuf(rawBuf)
 				log.Printf("[pipeline] %d IQ drops detected, DSP reset", dropped)
 				continue
 			}
 
-			// Convert CU8 → complex
-			iq := dsp.CU8ToComplex(rawBuf)
+			// Convert CU8 → complex into chain-owned scratch.
+			iq := dsp.CU8ToComplexInto(chain.iq, rawBuf)
+			chain.iq = iq
+			state.recycleBuf(rawBuf)
 
 			// --- FFT waterfall (on raw wideband IQ) ---
-			fftBuf = append(fftBuf, iq...)
-			if len(fftBuf) >= fftSize && time.Since(lastFFT) >= fftInterval {
-				fftFrame := make([]complex128, fftSize)
-				copy(fftFrame, fftBuf[:fftSize])
-				fftBuf = fftBuf[fftSize:]
-				lastFFT = time.Now()
+			// The FFT window is simply the tail of the current block: any
+			// contiguous fftSize samples are a valid snapshot, so there is no
+			// reason to accumulate (the old code appended every block into a
+			// growing buffer and threw away 99 % of it).
+			if len(iq) >= fftSize {
+				if time.Since(lastFFT) >= fftInterval {
+					lastFFT = time.Now()
 
-				dsp.HannWindow(fftFrame)
-				dsp.FFT(fftFrame)
-				bins := dsp.MagnitudeToU8(fftFrame)
+					copy(chain.fftFrame, iq[len(iq)-fftSize:])
+					chain.hann.Apply(chain.fftFrame)
+					dsp.FFT(chain.fftFrame)
+					bins := dsp.MagnitudeToBins(chain.fftBins, chain.fftFrame, cfg.FFTBins)
+					chain.fftBins = bins
 
-				// Send FFT datagram: [type][uint16 numBins][bins...]
-				dgram := make([]byte, 3+len(bins))
-				dgram[0] = protocol.DatagramFFT
-				dgram[1] = byte(len(bins) >> 8)
-				dgram[2] = byte(len(bins))
-				copy(dgram[3:], bins)
-				if err := conn.SendDatagram(dgram); err == nil {
+					// [type][uint16 numBins BE][bins...]
+					dgram := make([]byte, 3+len(bins))
+					dgram[0] = protocol.DatagramFFT
+					dgram[1] = byte(len(bins) >> 8)
+					dgram[2] = byte(len(bins))
+					copy(dgram[3:], bins)
+					state.broadcast(dgram)
 					fftSent++
 				}
-			}
-			// Keep FFT buffer bounded
-			if len(fftBuf) > fftSize*4 {
-				fftBuf = fftBuf[len(fftBuf)-fftSize:]
+			} else if !fftTooSmallLogged {
+				fftTooSmallLogged = true
+				log.Printf("[pipeline] IQ block (%d samples) smaller than fftsize (%d) — spectrum disabled",
+					len(iq), fftSize)
 			}
 
 			// --- Channel filter + demodulate ---
@@ -758,7 +996,7 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				chain.deemph.Process(audioSamples)
 			}
 
-			// AM voice cleanup: bandpass 300-3000 Hz
+			// AM voice cleanup: bandpass 400-3000 Hz
 			if chain.voiceHPF != nil {
 				chain.voiceHPF.Process(audioSamples)
 			}
@@ -767,11 +1005,11 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 			}
 
 			// Measure signal power for S-meter (before AGC)
-			var sumSq float64
-			for _, s := range audioSamples {
-				sumSq += s * s
-			}
 			if len(audioSamples) > 0 {
+				var sumSq float64
+				for _, s := range audioSamples {
+					sumSq += s * s
+				}
 				rms := math.Sqrt(sumSq / float64(len(audioSamples)))
 				if rms > 1e-10 {
 					signalPowerDb = float32(20 * math.Log10(rms))
@@ -780,7 +1018,7 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				}
 			}
 
-			// Send status datagram periodically
+			// Send status datagram periodically.
 			// Payload: [float32 smeter][float32 squelch][uint8 mode][uint64 freqHz]
 			if time.Since(lastStatus) >= statusInterval {
 				lastStatus = time.Now()
@@ -795,9 +1033,8 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				copy(statusDgram[5:9], protocol.EncodeFloat32(sq))
 				statusDgram[9] = byte(m)
 				copy(statusDgram[10:18], protocol.EncodeUint64(freq))
-				if err := conn.SendDatagram(statusDgram); err == nil {
-					statusSent++
-				}
+				state.broadcast(statusDgram)
+				statusSent++
 			}
 
 			// Emit seq-mark periodically so the client can compute loss.
@@ -809,16 +1046,23 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				binary.LittleEndian.PutUint32(mark[1:5], audioSent)
 				binary.LittleEndian.PutUint32(mark[5:9], fftSent)
 				binary.LittleEndian.PutUint32(mark[9:13], statusSent)
-				_ = conn.SendDatagram(mark)
+				state.broadcast(mark)
 			}
 
-			// Squelch gate: skip audio when signal is below threshold
+			// Squelch gate: skip audio when signal is below threshold.
 			state.mu.RLock()
 			squelchThreshold := state.squelchDb
 			state.mu.RUnlock()
 			if signalPowerDb < squelchThreshold {
+				if squelchOpen {
+					squelchOpen = false
+					// Drop the partial frame buffered in the encoder so it
+					// isn't prepended to the next transmission.
+					chain.opusEnc.Reset()
+				}
 				continue
 			}
+			squelchOpen = true
 
 			// AGC: smooth gain control (regular AGC for FM, hang-time for AM).
 			chain.gain.Process(audioSamples)
@@ -830,15 +1074,27 @@ func runPipeline(ctx context.Context, conn quic.Connection, state *serverState, 
 				continue
 			}
 
-			// Send audio datagrams
 			for _, pkt := range packets {
-				dgram := make([]byte, 1+len(pkt))
-				dgram[0] = protocol.DatagramAudio
-				copy(dgram[1:], pkt)
-				if err := conn.SendDatagram(dgram); err == nil {
-					audioSent++
-				}
+				state.broadcast(audioDatagram(cfg.AudioSeq, audioSeq, pkt))
+				audioSeq++
+				audioSent++
 			}
 		}
 	}
+}
+
+// audioDatagram wraps an Opus packet for the wire, with or without a sequence
+// number. See protocol.DatagramAudioSeq for why both forms exist.
+func audioDatagram(withSeq bool, seq uint16, pkt []byte) []byte {
+	if !withSeq {
+		dgram := make([]byte, 1+len(pkt))
+		dgram[0] = protocol.DatagramAudio
+		copy(dgram[1:], pkt)
+		return dgram
+	}
+	dgram := make([]byte, 3+len(pkt))
+	dgram[0] = protocol.DatagramAudioSeq
+	binary.LittleEndian.PutUint16(dgram[1:3], seq)
+	copy(dgram[3:], pkt)
+	return dgram
 }

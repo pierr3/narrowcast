@@ -25,15 +25,17 @@ final class ConnectionViewModel: ObservableObject {
     @Published var serverInfo: NarrowcastClient.ServerInfo?
     @Published var freqHz: UInt64 = 0
     @Published var mode: DemodMode = .nfm
-    @Published var sMeterDb: Float = -120
-    /// Peak-hold companion to sMeterDb. Holds the most recent peak then
-    /// decays at a fixed dB/sec so the UI shows a falling tick after a
-    /// burst transmission, classic analog meter behaviour.
-    @Published var sMeterPeakDb: Float = -120
-    private var lastStatusAt: CFTimeInterval = CACurrentMediaTime()
-    /// dB / second decay rate after a peak. 12 dB/s holds the tick at the
-    /// signal level for ~1 s of useful read time before falling.
-    private let peakDecayPerSec: Float = 12
+
+    /// S-meter level lives on its own observable object, deliberately.
+    ///
+    /// Status frames arrive ~10×/s, and while these were @Published on the view
+    /// model every frame invalidated the entire ListenView body: the favourites
+    /// bar, the segmented picker, three String(format:) calls and an
+    /// updateUIView on the Metal view, all rebuilt to move one meter. Scoping
+    /// the fast-changing values to a leaf object confines that redraw to the
+    /// meter itself.
+    let meter = MeterState()
+
     @Published var squelchDb: Float = -80
     @Published var clientCount: UInt8 = 0
     @Published var streaming: Bool = false  // local audio output gate
@@ -51,18 +53,16 @@ final class ConnectionViewModel: ObservableObject {
     private var connectedServerName: String = ""
     private let nowPlaying = NowPlayingController()
 
-    // Shared with SpectrumView. Pump feeds bins on the background context;
-    // the Metal renderer pulls a snapshot per frame.
+    // Shared with SpectrumView. The pump feeds bins on the background context;
+    // the Metal renderer aggregates them into bars on demand.
     let spectrumStore = SpectrumStore()
 
-    // Waterfall data is only published when a consumer asks for it. SwiftUI
-    // would otherwise redraw on every 10 Hz FFT regardless of visibility.
-    @Published var waterfallFrames: [[UInt8]] = []
-    var waterfallEnabled = false
-    private let waterfallDepth = 120
-
     private var client: NarrowcastClient?
-    private var pump: Task<Void, Never>?
+    /// The connect + event-pump task. Held so disconnect can actually cancel it
+    /// — this used to be a fire-and-forget `Task {}` whose handle was dropped,
+    /// which made disconnect()'s cancel a no-op and let a stale pump keep
+    /// feeding audio into a pipeline that had already been replaced.
+    private var sessionTask: Task<Void, Never>?
     // Stable handle the pump captures once. Pipeline mutations (e.g. mode
     // change rebuilding the decoder for a new sample rate) update the
     // contents without invalidating the pump's reference.
@@ -119,7 +119,7 @@ final class ConnectionViewModel: ObservableObject {
         let client = NarrowcastClient(config: cfg)
         self.client = client
 
-        Task { [weak self] in
+        sessionTask = Task { [weak self] in
             do {
                 let info = try await client.connect { stage in
                     Task { @MainActor in
@@ -165,10 +165,18 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     func disconnect() {
-        pump?.cancel()
-        pump = nil
+        sessionTask?.cancel()
+        sessionTask = nil
+        // Pending slider sends would otherwise land on the next connection.
+        squelchSendTask?.cancel()
+        squelchSendTask = nil
+        gainSendTask?.cancel()
+        gainSendTask = nil
         pipelineHolder.stop()
         connectedServerId = nil
+        // Don't leave a stale needle and spectrum behind on the next connect.
+        meter.reset()
+        spectrumStore.reset()
         nowPlaying.deactivate()
         let c = client
         client = nil
@@ -317,8 +325,8 @@ final class ConnectionViewModel: ObservableObject {
         let spectrum = self.spectrumStore
         for await event in await client.events {
             switch event {
-            case .audio(let opus):
-                holder.feed(opus)
+            case .audio(let opus, let seq):
+                holder.feed(opus, seq: seq)
 
             case .fft(let bins):
                 spectrum.update(bins: bins)
@@ -331,13 +339,6 @@ final class ConnectionViewModel: ObservableObject {
         }
         await MainActor.run {
             if self.state == .connected { self.state = .disconnected }
-        }
-    }
-
-    private func appendFFT(_ bins: [UInt8]) {
-        waterfallFrames.insert(bins, at: 0)
-        if waterfallFrames.count > waterfallDepth {
-            waterfallFrames.removeLast(waterfallFrames.count - waterfallDepth)
         }
     }
 
@@ -369,42 +370,41 @@ final class ConnectionViewModel: ObservableObject {
             serverInfo = info
 
         case .status(let s, let q, let m, let f, let cc):
-            sMeterDb = s
-            // Peak hold: snap up on rising edge, decay on falling edge by
-            // wall-clock delta since the last status frame.
-            let now = CACurrentMediaTime()
-            let dt = Float(max(0, now - lastStatusAt))
-            lastStatusAt = now
-            if s >= sMeterPeakDb {
-                sMeterPeakDb = s
-            } else {
-                sMeterPeakDb = max(s, sMeterPeakDb - peakDecayPerSec * dt)
-            }
-            squelchDb = q
+            // Only the meter changes on every frame; it lives on its own
+            // observable object so this doesn't invalidate the whole view.
+            meter.update(db: s)
+
+            // Everything below is echoed back unchanged most of the time, so
+            // guard each assignment: an unconditional write to a @Published
+            // property publishes whether or not the value moved, and at 10 Hz
+            // that is a pile of pointless SwiftUI invalidations.
+            if q != squelchDb { squelchDb = q }
+
+            // Captured before any mutation below: the old code read prevMode
+            // after assigning mode, so it always compared equal and lock-screen
+            // metadata never refreshed on a server-driven mode change.
+            let prevFreq = freqHz
+            let prevMode = mode
 
             if m != mode {
-                let prev = mode
                 mode = m
                 let needRate = sampleRate(for: m)
-                let prevRate = sampleRate(for: prev)
-                if needRate != prevRate {
+                if needRate != sampleRate(for: prevMode) {
                     pipelineHolder.set(try? AudioPipeline(sampleRate: needRate))
                 }
             }
             // Older Pi builds emit status without a freq field, decoded as 0.
             // Don't let that overwrite the optimistic local value the user
             // just set via tap-to-tune or the freq sheet.
-            let prevFreq = freqHz
-            let prevMode = mode
-            if f != 0 {
+            if f != 0, f != freqHz {
                 freqHz = f
             }
-            if let cc { clientCount = cc }
+            if let cc, cc != clientCount { clientCount = cc }
             // Only push lock-screen metadata when freq or mode actually
             // changed — calling MPNowPlayingInfoCenter on every status
-            // frame (20 Hz) was an XPC roundtrip per call and stalled the
-            // main thread enough to freeze the UI + audio pump in
-            // lockstep, with catch-up bursts every time the IPC unstuck.
+            // frame was an XPC roundtrip per call and stalled the main
+            // thread enough to freeze the UI + audio pump in lockstep,
+            // with catch-up bursts every time the IPC unstuck.
             if freqHz != prevFreq || mode != prevMode {
                 refreshNowPlaying()
             }

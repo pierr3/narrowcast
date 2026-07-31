@@ -2,13 +2,13 @@ package dsp
 
 import (
 	"math"
-	"math/cmplx"
 )
 
 // FMDemodulator performs FM demodulation using a polar discriminator.
 type FMDemodulator struct {
 	prev complex128
 	gain float64
+	out  []float64
 }
 
 // NewFMDemodulator creates an FM demodulator.
@@ -22,16 +22,29 @@ func NewFMDemodulator(maxDeviation float64, sampleRate float64) *FMDemodulator {
 }
 
 // Demodulate performs FM demodulation on complex IQ samples.
-// Returns real-valued audio samples.
+// Returns real-valued audio samples in a buffer owned by the demodulator,
+// valid until the next call (see the package comment).
 func (d *FMDemodulator) Demodulate(input []complex128) []float64 {
-	output := make([]float64, len(input))
-	for i, s := range input {
-		// Polar discriminator: angle difference between consecutive samples
-		product := s * cmplx.Conj(d.prev)
-		output[i] = cmplx.Phase(product) * d.gain
-		d.prev = s
+	if cap(d.out) < len(input) {
+		d.out = make([]float64, len(input))
 	}
-	return output
+	out := d.out[:len(input)]
+
+	pr, pi := real(d.prev), imag(d.prev)
+	for i, s := range input {
+		sr, si := real(s), imag(s)
+		// Polar discriminator: the angle of s · conj(prev), expanded by hand so
+		// this runs on plain floats rather than through cmplx.Conj + a complex
+		// multiply.
+		re := sr*pr + si*pi
+		im := si*pr - sr*pi
+		out[i] = math.Atan2(im, re) * d.gain
+		pr, pi = sr, si
+	}
+	d.prev = complex(pr, pi)
+
+	d.out = out
+	return out
 }
 
 // Reset clears the prev-sample state. Call after a hardware retune or on
@@ -44,6 +57,7 @@ func (d *FMDemodulator) Reset() {
 // with a proper DC blocking filter.
 type AMDemodulator struct {
 	dcBlock *DCBlocker
+	out     []float64
 }
 
 // NewAMDemodulator creates an AM envelope detector.
@@ -54,14 +68,25 @@ func NewAMDemodulator() *AMDemodulator {
 }
 
 // Demodulate performs AM demodulation on complex IQ samples.
-// Returns real-valued audio samples.
+// Returns real-valued audio samples in a buffer owned by the demodulator,
+// valid until the next call (see the package comment).
 func (d *AMDemodulator) Demodulate(input []complex128) []float64 {
-	output := make([]float64, len(input))
-	for i, s := range input {
-		output[i] = cmplx.Abs(s)
+	if cap(d.out) < len(input) {
+		d.out = make([]float64, len(input))
 	}
-	d.dcBlock.Process(output)
-	return output
+	out := d.out[:len(input)]
+
+	for i, s := range input {
+		re, im := real(s), imag(s)
+		// sqrt(re²+im²) rather than cmplx.Abs: Abs routes through math.Hypot,
+		// which spends its time on overflow handling for magnitudes we can't
+		// reach — post-FIR samples here sit within a few units of full scale.
+		out[i] = math.Sqrt(re*re + im*im)
+	}
+	d.dcBlock.Process(out)
+
+	d.out = out
+	return out
 }
 
 // Reset clears the DC blocker state.
@@ -99,68 +124,6 @@ func (d *DCBlocker) Process(samples []float64) {
 func (d *DCBlocker) Reset() {
 	d.xPrev = 0
 	d.yPrev = 0
-}
-
-// NoiseGate applies a soft noise gate with attack/release smoothing.
-// When signal RMS is below threshold, gain ramps down to zero.
-// When above, gain ramps back up to 1.0.
-type NoiseGate struct {
-	thresholdLin float64 // linear amplitude threshold
-	attackCoeff  float64 // per-sample coefficient for opening (fast)
-	releaseCoeff float64 // per-sample coefficient for closing (slow)
-	gain         float64 // current gain 0-1
-}
-
-// NewNoiseGate creates a soft noise gate.
-// thresholdDb is the gate threshold in dB (e.g., -40).
-// attackMs is how fast the gate opens (e.g., 5 ms).
-// releaseMs is how fast the gate closes (e.g., 150 ms).
-// sampleRate is the audio sample rate.
-func NewNoiseGate(thresholdDb float64, attackMs float64, releaseMs float64, sampleRate float64) *NoiseGate {
-	return &NoiseGate{
-		thresholdLin: math.Pow(10, thresholdDb/20),
-		attackCoeff:  1.0 - math.Exp(-1.0/(attackMs*0.001*sampleRate)),
-		releaseCoeff: 1.0 - math.Exp(-1.0/(releaseMs*0.001*sampleRate)),
-		gain:         0,
-	}
-}
-
-// Process applies the noise gate in-place.
-// frameSize is how many samples to measure RMS over (e.g., 160 for 10ms at 16kHz).
-func (ng *NoiseGate) Process(samples []float64, frameSize int) {
-	if frameSize < 1 {
-		frameSize = len(samples)
-	}
-	for i := 0; i < len(samples); i += frameSize {
-		end := i + frameSize
-		if end > len(samples) {
-			end = len(samples)
-		}
-		frame := samples[i:end]
-
-		// Measure RMS of this frame
-		var sumSq float64
-		for _, s := range frame {
-			sumSq += s * s
-		}
-		rms := math.Sqrt(sumSq / float64(len(frame)))
-
-		// Determine target gain
-		var targetGain float64
-		if rms >= ng.thresholdLin {
-			targetGain = 1.0
-		}
-
-		// Apply per-sample gain smoothing
-		for j := range frame {
-			if targetGain > ng.gain {
-				ng.gain += ng.attackCoeff * (targetGain - ng.gain)
-			} else {
-				ng.gain += ng.releaseCoeff * (targetGain - ng.gain)
-			}
-			frame[j] *= ng.gain
-		}
-	}
 }
 
 // HighPassIIR is a 2nd-order (biquad) high-pass filter for removing
@@ -217,19 +180,34 @@ func (f *HighPassIIR) Reset() {
 // instead of hard-clipping.
 type SoftLimiter struct {
 	drive float64 // controls compression knee (higher = more compression)
+	norm  float64 // 1 / tanh(drive), so unity input maps to unity output
+	// linear is the |sample| below which tanh(x)/tanh(drive) and x are within
+	// ~0.5 % of each other, so the transcendental can be skipped entirely.
+	// Quiet audio spends most of its samples here.
+	linear float64
 }
 
 // NewSoftLimiter creates a soft limiter.
 // drive controls how aggressively signals are compressed.
 // 1.0 = gentle, 2.0 = moderate, 3.0+ = heavy compression.
 func NewSoftLimiter(drive float64) *SoftLimiter {
-	return &SoftLimiter{drive: drive}
+	return &SoftLimiter{
+		drive:  drive,
+		norm:   1.0 / math.Tanh(drive),
+		linear: 0.1 / drive,
+	}
 }
 
 // Process applies soft limiting in-place.
 func (l *SoftLimiter) Process(samples []float64) {
+	drive, norm, linear := l.drive, l.norm, l.linear
 	for i, s := range samples {
-		samples[i] = math.Tanh(s * l.drive) / math.Tanh(l.drive)
+		if s < linear && s > -linear {
+			// tanh(x) ≈ x here, and the normalization is a plain scale.
+			samples[i] = s * drive * norm
+			continue
+		}
+		samples[i] = math.Tanh(s*drive) * norm
 	}
 }
 

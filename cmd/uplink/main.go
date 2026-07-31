@@ -240,6 +240,25 @@ func run(ctx context.Context, localAddr string, relayUDP *net.UDPAddr, relayHost
 	}
 	log.Printf("[uplink] bridging datagrams (SDR idle until client sends Start)")
 
+	// Both directions send through a protocol.Writer. quic-go's SendDatagram
+	// blocks once 32 frames are queued, and a blocked forward here is the worst
+	// place for it: the Pi→relay goroutine stops reading from narrowcast, which
+	// blocks narrowcast's pipeline, which makes the SDR drop IQ buffers and
+	// reset its DSP state. Shedding a datagram on a congested uplink costs one
+	// packet; blocking costs seconds of audio.
+	relayWriter := protocol.NewWriter(relayConn)
+	defer relayWriter.Close()
+	localWriter := protocol.NewWriter(localConn)
+	defer localWriter.Close()
+	defer func() {
+		if drops, errs := relayWriter.Stats(); drops > 0 || errs > 0 {
+			log.Printf("[uplink] relay direction shed %d datagrams, %d send errors", drops, errs)
+		}
+		if drops, errs := localWriter.Stats(); drops > 0 || errs > 0 {
+			log.Printf("[uplink] local direction shed %d datagrams, %d send errors", drops, errs)
+		}
+	}()
+
 	// Bidirectional forwarding
 	var wg sync.WaitGroup
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
@@ -265,7 +284,7 @@ func run(ctx context.Context, localAddr string, relayUDP *net.UDPAddr, relayHost
 				errMu.Unlock()
 				return
 			}
-			_ = relayConn.SendDatagram(dg)
+			relayWriter.Send(dg)
 		}
 	}()
 
@@ -284,7 +303,7 @@ func run(ctx context.Context, localAddr string, relayUDP *net.UDPAddr, relayHost
 				errMu.Unlock()
 				return
 			}
-			_ = localConn.SendDatagram(dg)
+			localWriter.Send(dg)
 		}
 	}()
 

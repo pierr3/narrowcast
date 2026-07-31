@@ -86,10 +86,10 @@ func main() {
 				continue
 			}
 			switch dg[0] {
-			case protocol.DatagramAudio:
+			case protocol.DatagramAudio, protocol.DatagramAudioSeq:
 				audioPkts++
 				if audioPkts == 1 {
-					log.Printf("First audio datagram: %d bytes", len(dg))
+					log.Printf("First audio datagram: %d bytes (type 0x%02x)", len(dg), dg[0])
 				}
 			case protocol.DatagramFFT:
 				fftPkts++

@@ -23,7 +23,9 @@ make run             # build + run on :4444 with self-signed certs
 
 macOS deps: `brew install librtlsdr opus opusfile pkg-config`. Pi/Linux: `sudo apt install librtlsdr-dev libopus-dev libopusfile-dev`. The Makefile injects `CGO_CFLAGS`/`CGO_LDFLAGS` for Homebrew paths on macOS.
 
-There is no test suite. Manual verification with `--simulate` (synthetic IQ source in `pkg/sdr/simulate.go`) avoids needing real hardware.
+Tests cover the pure logic where a silent regression would be expensive: `pkg/dsp` (filters checked against direct convolution and for block-size invariance, FFT/bin pooling), `pkg/protocol` (the non-blocking datagram writer), `pkg/config` (sample-rate validation). Run with `go test ./pkg/...`; the writer tests are worth running under `-race`. There is no coverage of the QUIC plumbing or the DSP chain end to end — verify those with `--simulate` (synthetic IQ source in `pkg/sdr/simulate.go`) plus `cmd/testclient`, which needs no radio.
+
+`--pprof localhost:6060` exposes `net/http/pprof`. Use it before optimizing anything on the Pi; the thermal budget is the real constraint and guesses about where the cycles go have been wrong before.
 
 ## Three-process topology
 
@@ -42,10 +44,12 @@ The relay listens on **UDP/443** (QUIC standard port; survives more hostile fire
 
 Single QUIC connection per peer; **datagrams for everything** — commands, audio, FFT, telemetry. There are no reliable streams used for runtime data. See `pkg/protocol/protocol.go` for the canonical list. Two type-byte ranges:
 
-- `0x01–0x04` server→client data (`Audio`, `FFT`, `Status`, `SeqMark`)
+- `0x01–0x05` server→client data (`Audio`, `FFT`, `Status`, `SeqMark`, `AudioSeq`)
 - `0x10–0x35` commands (`SetFrequency`, `SetMode`, `SetSquelch`, `SetGain`, `QualityReport`, `Start`, `Stop`, `Hello`, `Welcome`, auth)
 
 When extending the protocol: assign a new type byte, document the payload layout in a comment above the constant, ensure unknown types are silently ignored on both sides (older clients/relays must keep working). The relay forwards datagrams it doesn't recognize unchanged.
+
+**Never call `quic.Connection.SendDatagram` directly from a data path.** It *blocks* once 32 datagram frames are queued (quic-go `datagram_queue.go`), and every producer here is realtime, so blocking propagates backwards into the SDR: pipeline blocks → stops draining `iqChan` → SDR callback drops buffers → DSP resets → seconds of broken audio from one brief hiccup. In the relay it was worse, since one slow client stalled the fan-out loop and therefore every listener plus the radio itself. Use `protocol.Writer`, which owns the blocking send in its own goroutine and sheds the oldest queued datagram instead of waiting (FFT frames first, audio last). Direct sends are fine only for handshake replies on a fresh connection.
 
 ## DSP pipeline
 
@@ -63,22 +67,29 @@ CU8 IQ → xlating FIR (mix + decimate) → demod (FM/AM)
 
 Three modes (`pkg/protocol/protocol.go`): `NFM` (16 kHz / 16 kHz audio), `WFM` (200 / 48), `AM` (25 / 16, full ICAO aviation channel).
 
+Three modes' worth of chain, but **one pipeline for the whole device**, not one per client. `serverState` reference-counts listeners (connections that sent `CmdStart`) and every output datagram is broadcast to all subscribers. It used to be per-client, with all of them reading the same `iqChan` — two connections then stole alternating IQ blocks from each other, so both got half the sample stream and both produced broken audio, at double the CPU. The relay path hides this (one upstream connection) except during an uplink reconnect overlap. Keep the pipeline shared.
+
 A few non-obvious invariants:
 
 - **AM uses `AudioAGC` (hang-time), not `AGC`** — standard AGC ramps gain into the noise floor between pushes-to-talk and clips the start of the next transmission. Hang-time freezes gain during dead air. Don't change AM to regular AGC.
 - **AM skips the soft limiter** — amplitude IS the audio in AM, so tanh compression distorts the voice.
 - **`dspChain.Reset()` is called on two events**: hardware retune (drains stale IQ from `iqChan` + zeros every filter history), and SDR drop (the callback dropped buffers because the pipeline couldn't keep up). Continuing to filter across a discontinuity produces audible warbling. Any new stateful DSP stage must implement `Reset()`.
 - **The SDR drop counter** (`state.dropCount`, an `atomic.Uint64`) is the only signal that the IQ stream had a gap. If you add a new DSP entry point, sync the `lastDrops` baseline before processing.
+- **DSP stages own their output buffers.** Anything returning a slice (`XlatingFilter`, `RealFIRFilter`, the demodulators, `CU8ToComplexInto`, `MagnitudeToBins`) hands back storage it reuses on the next call; callers must not retain it. This is what makes a steady-state block allocation-free, which matters because the GC cost of the old ~40 MB/s of churn was a real slice of the Pi's thermal budget. A new stage that allocates per block breaks that property silently.
+- **The sample rate must be an exact multiple of every mode's audio rate** (i.e. of 48000), enforced by `config.Validate`. Decimation is integer division, so 1.024 MS/s silently yields WFM audio clocked 1.6 % wrong. Default is 960 kS/s; raising it scales the channel filter's cost roughly linearly.
+- **`iqWanted` gates the SDR callback.** With no listeners nothing copies IQ out of the USB ring — idle heat for nobody.
 
 ## Bandwidth-adaptive feedback loop
 
 The server emits `DatagramSeqMark` (type `0x04`) once per second carrying `[u32 audioSent][u32 fftSent][u32 statusSent]`. Clients diff against their own receive counts and report measured loss back via `CmdQualityReport` (`0x14`). The pipeline reacts in `runPipeline`'s `qualityChan` case:
 
 - `adaptFFTInterval(base, lossPct)` — steps from configured rate down to 1/10 (e.g. 10 → 1 fps)
-- `adaptOpusBitrate(base, lossPct)` — steps 32 → 24 → **16 kbps floor**. Below 16 kbps, voice quality drops below acceptable for the monitoring use case; below the floor we'd rather rely on QUIC's natural cutout than ship muddy audio.
+- `adaptOpusBitrate(base, lossPct)` — steps 32 → 24 → 20 → **16 kbps floor**. Below 16 kbps, voice quality drops below acceptable for the monitoring use case; below the floor we'd rather rely on QUIC's natural cutout than ship muddy audio.
 - `adaptOpusLossPerc(lossPct)` — `lossPct + 5`, clamped 5–50, fed to `opus.SetPacketLossPerc` so FEC redundancy tracks observed loss.
 
 Old clients that don't report stay at full quality; the loop is purely advisory and never blocks the audio path.
+
+The FEC bits this pays for are only redeemable if the client can tell a lost packet from a closed squelch, which is what `DatagramAudioSeq` (`0x05`) is for — see `docs/PROTOCOL.md`. The seq counters in `SeqMark` deliberately count datagrams *queued*, including ones `protocol.Writer` sheds locally, so server-side shedding also shows up as measured loss.
 
 ## Operational gotchas
 
@@ -86,10 +97,12 @@ Old clients that don't report stay at full quality; the loop is purely advisory 
 - **Relay redeploy is rare**: only redeploy the relay when a commit touches `cmd/relay`, `pkg/protocol`, or shared types. Pure DSP / SDR-side commits are Pi-only. `update.sh` auto-detects role from installed systemd units.
 - **TLS cert paths**: relay reads from `/etc/narrowcast-relay/certs/server.{crt,key}`. The installer writes a Let's Encrypt renewal hook at `/etc/letsencrypt/renewal-hooks/post/narrowcast-relay.sh` that copies the renewed cert into that directory and bounces the service — needed because the unprivileged `narrowcast` user can't traverse `/etc/letsencrypt/live/`.
 - **Last-writer-wins on tuning**: any connected client can `SetFrequency` / `SetMode`. There is no per-client virtual VFO yet (it's the top item on the README roadmap); a frequency change affects everyone.
+- **IQ block size must be a multiple of 512.** librtlsdr silently replaces any other `buf_len` with its own 256 KiB default — the old `sampleRate/10*2` request was in fact getting 137 ms blocks. `iqBufBytes` targets 20 ms rounded down to 512 B.
 
 ## Editing rules of thumb
 
 - Prefer editing `pkg/dsp` over adding new packages. The DSP code is the load-bearing surface; keep it small and explicit.
-- New protocol fields: add the constant + payload doc in `pkg/protocol/protocol.go`, update the README protocol table, ensure server and client tolerate the absence of the field on the other side.
+- New protocol fields: add the constant + payload doc in `pkg/protocol/protocol.go`, update the README protocol table and `docs/PROTOCOL.md`, ensure server and client tolerate the absence of the field on the other side.
+- On the Pi side, hot-path work is measured in per-block microseconds against a 20 ms budget, and allocation counts as work. `go test -bench . ./pkg/dsp` reports both; keep `allocs/op` at zero for the steady state.
 - Don't introduce reliable streams for runtime data. Datagrams are the design — head-of-line blocking on a slow stream is the failure mode being avoided.
 - The relay must remain pure Go (`CGO_ENABLED=0`) so it builds for any VPS without C deps.

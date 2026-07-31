@@ -48,13 +48,24 @@ func main() {
 	}
 }
 
+// relay holds one upstream (the Pi uplink) plus N clients and moves datagrams
+// between them.
+//
+// Every send goes through a protocol.Writer, which is load-bearing rather than
+// tidiness: quic-go's SendDatagram blocks once 32 frames are queued, so the
+// previous direct-send fan-out let one slow phone stall the loop that reads from
+// upstream. That backpressure travelled the whole chain — relay stops reading →
+// uplink's send blocks → uplink stops reading the Pi → the Pi's pipeline blocks
+// → SDR buffers drop → DSP resets. A single bad client froze every listener and
+// glitched the radio. Writers shed datagrams per connection instead.
 type relay struct {
 	uplinkHash [32]byte
 	clientHash [32]byte
 
-	mu       sync.RWMutex
-	upstream quic.Connection            // the Pi uplink connection
-	clients  map[string]quic.Connection // connected clients
+	mu           sync.RWMutex
+	upstream     *protocol.Writer
+	upstreamConn quic.Connection
+	clients      map[string]*protocol.Writer
 }
 
 func (r *relay) run(ctx context.Context, listenAddr, certFile, keyFile string) error {
@@ -95,7 +106,7 @@ func (r *relay) run(ctx context.Context, listenAddr, certFile, keyFile string) e
 	}
 	defer ln.Close()
 
-	r.clients = make(map[string]quic.Connection)
+	r.clients = make(map[string]*protocol.Writer)
 
 	log.Printf("[relay] listening on %s (waiting for uplink + clients)", listenAddr)
 
@@ -115,7 +126,7 @@ func (r *relay) handleNewConnection(ctx context.Context, conn quic.Connection) {
 	remote := conn.RemoteAddr().String()
 
 	// First datagram determines if this is an uplink or a client
-	authCtx, authCancel := context.WithTimeout(ctx, 10_000_000_000) // 10s
+	authCtx, authCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer authCancel()
 
 	dgram, err := conn.ReceiveDatagram(authCtx)
@@ -140,35 +151,50 @@ func (r *relay) handleNewConnection(ctx context.Context, conn quic.Connection) {
 	}
 }
 
-func (r *relay) handleUplink(ctx context.Context, conn quic.Connection, dgram []byte, remote string) {
+// checkAuth compares the 32-byte hash in an auth datagram against want,
+// replying and closing the connection on failure.
+//
+// Auth replies go out directly rather than through a Writer: the connection is
+// brand new so its datagram queue is empty (no blocking risk), and the failure
+// path needs the reply on the wire before CloseWithError.
+func checkAuth(conn quic.Connection, dgram []byte, want [32]byte, role, remote string) bool {
 	if len(dgram) < 33 {
-		log.Printf("[relay] %s: uplink auth too short", remote)
+		log.Printf("[relay] %s: %s auth too short", remote, role)
 		conn.CloseWithError(0, "bad-auth")
-		return
+		return false
 	}
-
 	var hash [32]byte
 	copy(hash[:], dgram[1:33])
-	if hash != r.uplinkHash {
-		log.Printf("[relay] %s: uplink auth failed", remote)
+	if hash != want {
+		log.Printf("[relay] %s: %s auth failed", remote, role)
 		_ = conn.SendDatagram([]byte{protocol.CmdAuthFail})
 		conn.CloseWithError(0, "bad-auth")
+		return false
+	}
+	_ = conn.SendDatagram([]byte{protocol.CmdAuthOK})
+	return true
+}
+
+func (r *relay) handleUplink(ctx context.Context, conn quic.Connection, dgram []byte, remote string) {
+	if !checkAuth(conn, dgram, r.uplinkHash, "uplink", remote) {
 		return
 	}
 
-	_ = conn.SendDatagram([]byte{protocol.CmdAuthOK})
+	w := protocol.NewWriter(conn)
 
-	// Replace existing upstream
+	// Replace any existing upstream.
 	r.mu.Lock()
-	if r.upstream != nil {
-		r.upstream.CloseWithError(0, "replaced")
+	if r.upstreamConn != nil {
+		r.upstream.Close()
+		r.upstreamConn.CloseWithError(0, "replaced")
 	}
-	r.upstream = conn
+	r.upstream = w
+	r.upstreamConn = conn
 	r.mu.Unlock()
 
 	log.Printf("[relay] uplink connected: %s", remote)
 
-	// Read datagrams from upstream and fan out to all clients
+	// Read datagrams from upstream and fan out to all clients.
 	for {
 		dg, err := conn.ReceiveDatagram(ctx)
 		if err != nil {
@@ -178,37 +204,32 @@ func (r *relay) handleUplink(ctx context.Context, conn quic.Connection, dgram []
 	}
 
 	r.mu.Lock()
-	if r.upstream == conn {
+	if r.upstreamConn == conn {
 		r.upstream = nil
+		r.upstreamConn = nil
 	}
 	r.mu.Unlock()
+	w.Close()
+
+	if drops, errs := w.Stats(); drops > 0 || errs > 0 {
+		log.Printf("[relay] uplink %s: shed %d datagrams, %d send errors", remote, drops, errs)
+	}
 	log.Printf("[relay] uplink disconnected: %s", remote)
 }
 
 func (r *relay) handleClient(ctx context.Context, conn quic.Connection, dgram []byte, remote string) {
-	if len(dgram) < 33 {
-		log.Printf("[relay] %s: client auth too short", remote)
-		conn.CloseWithError(0, "bad-auth")
+	if !checkAuth(conn, dgram, r.clientHash, "client", remote) {
 		return
 	}
 
-	var hash [32]byte
-	copy(hash[:], dgram[1:33])
-	if hash != r.clientHash {
-		log.Printf("[relay] %s: client auth failed", remote)
-		_ = conn.SendDatagram([]byte{protocol.CmdAuthFail})
-		conn.CloseWithError(0, "bad-auth")
-		return
-	}
+	w := protocol.NewWriter(conn)
 
-	_ = conn.SendDatagram([]byte{protocol.CmdAuthOK})
-
-	// Register client
 	r.mu.Lock()
-	r.clients[remote] = conn
+	r.clients[remote] = w
+	count := len(r.clients)
 	r.mu.Unlock()
 
-	log.Printf("[relay] client authenticated: %s (%d clients)", remote, len(r.clients))
+	log.Printf("[relay] client authenticated: %s (%d clients)", remote, count)
 
 	defer func() {
 		r.mu.Lock()
@@ -216,17 +237,22 @@ func (r *relay) handleClient(ctx context.Context, conn quic.Connection, dgram []
 		remaining := len(r.clients)
 		up := r.upstream
 		r.mu.Unlock()
+
+		w.Close()
 		conn.CloseWithError(0, "bye")
+		if drops, errs := w.Stats(); drops > 0 || errs > 0 {
+			log.Printf("[relay] client %s: shed %d datagrams, %d send errors", remote, drops, errs)
+		}
 		log.Printf("[relay] client disconnected: %s (%d remaining)", remote, remaining)
 
-		// Stop SDR when last client disconnects
+		// Stop the SDR when the last client disconnects.
 		if remaining == 0 && up != nil {
-			_ = up.SendDatagram([]byte{protocol.CmdStop})
+			up.Send([]byte{protocol.CmdStop})
 			log.Printf("[relay] no clients remaining, sent Stop to upstream")
 		}
 	}()
 
-	// Read datagrams from client and forward to upstream (all clients can tune)
+	// Read datagrams from the client and forward upstream (all clients can tune).
 	for {
 		dg, err := conn.ReceiveDatagram(ctx)
 		if err != nil {
@@ -236,7 +262,7 @@ func (r *relay) handleClient(ctx context.Context, conn quic.Connection, dgram []
 		up := r.upstream
 		r.mu.RUnlock()
 		if up != nil {
-			_ = up.SendDatagram(dg)
+			up.Send(dg)
 		}
 	}
 }
@@ -245,7 +271,7 @@ func (r *relay) fanOutToClients(dg []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Append client count to status datagrams so clients can display it
+	// Append the client count to status datagrams so clients can display it.
 	out := dg
 	if len(dg) > 0 && dg[0] == protocol.DatagramStatus {
 		out = make([]byte, len(dg)+1)
@@ -257,7 +283,11 @@ func (r *relay) fanOutToClients(dg []byte) {
 		out[len(dg)] = byte(count)
 	}
 
-	for _, c := range r.clients {
-		_ = c.SendDatagram(out)
+	// Holding the read lock across these sends is safe precisely because
+	// Writer.Send queues or drops and never blocks on the network. Sharing
+	// `out` between writers is fine too: none of them mutate it, and quic-go
+	// copies the payload into each datagram frame.
+	for _, w := range r.clients {
+		w.Send(out)
 	}
 }

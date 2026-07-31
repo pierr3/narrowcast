@@ -38,13 +38,21 @@ public actor QUICTransport {
 
     public let inbound: AsyncStream<Data>
 
+    /// Inbound buffer depth. AsyncStream defaults to unbounded, which for a
+    /// realtime datagram feed is a latency trap: any consumer stall (a busy main
+    /// thread, a slow decode) silently grows the queue, and the backlog is then
+    /// delivered as a burst instead of dropped. 64 datagrams is a little over a
+    /// second of audio; past that, newest-wins is the correct behaviour on a
+    /// path that already assumes loss.
+    private static let inboundDepth = 64
+
     public init(host: String, port: UInt16, mode: Mode, alpn: String = "narrowcast-v1") {
         self.host = host
         self.port = port
         self.mode = mode
         self.alpn = alpn
         var cont: AsyncStream<Data>.Continuation!
-        self.inbound = AsyncStream { c in cont = c }
+        self.inbound = AsyncStream(bufferingPolicy: .bufferingNewest(Self.inboundDepth)) { c in cont = c }
         self.inboundContinuation = cont
     }
 
@@ -97,10 +105,17 @@ public actor QUICTransport {
         // is what the working example uses; the one with explicit max size +
         // rejectOversized parameters appears not to be wired up for QUIC
         // datagram delivery.
-        group.setReceiveHandler { [weak self] _, content, _ in
-            guard let self else { return }
+        //
+        // The continuation is captured directly instead of hopping through the
+        // actor. `yield` is Sendable and synchronous, so this both avoids a Task
+        // allocation per datagram (~90/s at default rates) and — more
+        // importantly — preserves ordering: tasks enqueued on an actor have no
+        // FIFO guarantee, so the old `Task { await deliverInbound(…) }` could
+        // reorder Opus packets on their way to the decoder.
+        let cont = self.inboundContinuation
+        group.setReceiveHandler { _, content, _ in
             guard let content, !content.isEmpty else { return }
-            Task { await self.deliverInbound(content) }
+            cont?.yield(content)
         }
 
         try await withCheckedThrowingContinuation { (cc: CheckedContinuation<Void, Error>) in
@@ -159,10 +174,6 @@ public actor QUICTransport {
     }
 
     // MARK: - Private
-
-    private func deliverInbound(_ data: Data) {
-        inboundContinuation?.yield(data)
-    }
 
     private func handleDisconnect() {
         inboundContinuation?.finish()

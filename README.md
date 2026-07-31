@@ -29,9 +29,9 @@ Narrowcast does server-side demodulation and sends only the finished audio + a d
 | Stream    | Size      | Notes                                          |
 | --------- | --------- | ---------------------------------------------- |
 | Opus audio| ~4 KB/s   | 32 kbps mono + in-band FEC for ~10% loss       |
-| FFT       | ~10 KB/s  | 1024 u8 bins × 10 fps                          |
-| Status    | ~70 B/s   | S-meter, mode, freq, squelch, client count     |
-| **Total** | **~14 KB/s** | **~110 kbps — fits 3G / weak LTE / sat**       |
+| FFT       | ~2.6 KB/s | 256 u8 bins × 10 fps, max-pooled from a 1024-point FFT |
+| Status    | ~200 B/s  | S-meter, mode, freq, squelch, client count @ 10 Hz |
+| **Total** | **~7 KB/s** | **~56 kbps — fits 3G / weak LTE / sat**        |
 
 Reference: SpyServer ~200 KB/s. SDR++ raw IQ: 4–10 Mbps. Narrowcast is 15–500× lighter.
 
@@ -143,7 +143,8 @@ QUIC over UDP, TLS 1.3, single port. Datagrams for everything — commands, audi
 
 | Datagram type | Direction      | Payload                                           |
 | ------------- | -------------- | ------------------------------------------------- |
-| `0x01` audio  | server→client  | Opus packet                                       |
+| `0x01` audio  | server→client  | Opus packet (legacy form, no sequence number)     |
+| `0x05` audio  | server→client  | `[u16 seq][Opus packet]` — the default; seq is what lets the client redeem the encoder's in-band FEC |
 | `0x02` FFT    | server→client  | `[u16 numBins][u8 bins...]`                       |
 | `0x03` status | server→client  | `[f32 smeter][f32 squelch][u8 mode][u64 freq][u8 cc?]` |
 | `0x04` seqmark| server→client  | `[u32 audioSent][u32 fftSent][u32 statusSent]` (1/s)|
@@ -170,10 +171,13 @@ narrowcast [flags]
   --key           TLS key file (default: certs/server.key)
   --serial        RTL-SDR device serial (overrides --device)
   --device        RTL-SDR device index (default: 0)
-  --samplerate    RTL-SDR sample rate (default: 2400000)
-  --fftsize       FFT bin count (default: 1024)
-  --fftrate       FFT frames/sec (default: 20)
+  --samplerate    RTL-SDR sample rate, must be a multiple of 48000 (default: 960000)
+  --fftsize       FFT length, power of two (default: 1024)
+  --fftbins       Bins transmitted per frame, max-pooled from fftsize (default: 256)
+  --fftrate       FFT frames/sec (default: 10)
   --opus-bitrate  Opus bitrate in bps (default: 32000)
+  --audio-seq     Sequence-numbered audio datagrams (default: true)
+  --pprof         Serve net/http/pprof on this address, e.g. localhost:6060
   --simulate      Use simulated SDR (no hardware needed)
 ```
 

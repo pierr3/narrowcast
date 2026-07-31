@@ -34,9 +34,11 @@ public final class LossTracker: @unchecked Sendable {
     public func recordReceived(_ type: DatagramType) {
         lock.lock(); defer { lock.unlock() }
         switch type {
-        case .audio:    receivedSinceStart.audio &+= 1
-        case .fft:      receivedSinceStart.fft &+= 1
-        case .status:   receivedSinceStart.status &+= 1
+        // Both audio datagram forms count against the server's single audio
+        // send-counter, so they share a bucket here.
+        case .audio, .audioSeq: receivedSinceStart.audio &+= 1
+        case .fft:              receivedSinceStart.fft &+= 1
+        case .status:           receivedSinceStart.status &+= 1
         case .seqMark, .welcome, .authOK, .authFail:
             break
         }

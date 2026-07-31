@@ -5,51 +5,80 @@ import MetalKit
 import UIKit
 #endif
 
-// SpectrumView wraps a Metal-backed MTKView in SwiftUI. The view runs at
-// 60 fps regardless of the FFT frame rate from the server (which adapts
-// from 20 fps down to 1 fps under loss). Smoothing + peak hold come from
-// SpectrumStore; this layer is purely presentation.
+// SpectrumView wraps a Metal-backed MTKView in SwiftUI.
+//
+// It draws a bar chart rather than a 1024-point line. On a phone the old line
+// had ~3 FFT bins per point of width — detail the screen physically cannot
+// resolve — and it redrew at 60 fps on the main thread regardless of the FFT
+// rate, which is main-thread time competing with SwiftUI. Bars are both cheaper
+// and more legible: one bar covers a channel-sized slice of spectrum, so "which
+// block is busy" is readable at a glance.
 struct SpectrumView: UIViewRepresentable {
 
     let store: SpectrumStore
-    let squelchDb: Float    // dBm, mapped same -120..0 scale as FFT bins
 
     func makeUIView(context: Context) -> MetalSpectrumView {
-        let v = MetalSpectrumView()
-        v.store = store
-        v.squelchDb = squelchDb
-        return v
+        MetalSpectrumView(store: store)
     }
 
     func updateUIView(_ v: MetalSpectrumView, context: Context) {
         v.store = store
-        v.squelchDb = squelchDb
+    }
+
+    static func dismantleUIView(_ v: MetalSpectrumView, coordinator: ()) {
+        v.detach()
     }
 }
 
 final class MetalSpectrumView: MTKView, MTKViewDelegate {
 
-    var store: SpectrumStore?
-    var squelchDb: Float = -80
+    var store: SpectrumStore {
+        didSet {
+            guard oldValue !== store else { return }
+            oldValue.setFrameHandler(nil)
+            attachIfVisible()
+        }
+    }
+
+    /// Target width of one bar plus its gap, in points. ~6 pt gives about 60
+    /// bars on a phone, which at a 960 kHz span is ~16 kHz per bar — one
+    /// narrowband channel each.
+    private let barPitch: CGFloat = 6
+    /// Fraction of each slot left empty between bars.
+    private let gapFraction: Float = 0.22
+    /// Headroom above the tallest bar so it doesn't touch the edge labels.
+    private let yScale: Float = 0.92
+    /// Height of the peak-hold cap, in normalized view units.
+    private let peakCapHeight: Float = 0.025
 
     private let commandQueue: MTLCommandQueue
+    private let barPipeline: MTLRenderPipelineState
     private let linePipeline: MTLRenderPipelineState
 
-    // Top edge line strip — the spectrum curve itself. One vertex per bin.
-    private var topLineBuffer: MTLBuffer
-    private var topLineCount: Int = 0
+    // Bars and peak caps share one buffer and one draw call: 6 vertices per
+    // quad, two quads per bar.
+    private static let maxBars = 256
+    private static let vertsPerBar = 12
+    private var barBuffer: MTLBuffer
+    private var barVertexCount = 0
 
-    // Peak-hold trace.
-    private var peakLineBuffer: MTLBuffer
-    private var peakLineCount: Int = 0
-
-    // Static decoration: squelch threshold + center crosshair. Rebuilt
-    // when squelchDb changes.
+    // Static centre-frequency marker.
     private var decorBuffer: MTLBuffer
-    private var decorSegments: [(start: Int, count: Int, color: SIMD4<Float>)] = []
-    private var lastSquelchDb: Float = .nan
 
-    init() {
+    // Scratch for the store read, sized to the current bar count.
+    private var levels: [Float] = []
+    private var peaks: [Float] = []
+
+    /// Matches `BarVertex` in Shaders.metal. `pad` keeps `color` at offset 16.
+    private struct BarVertex {
+        var pos: SIMD2<Float>
+        var pad: SIMD2<Float> = .zero
+        var color: SIMD4<Float>
+    }
+
+    init(store: SpectrumStore) {
+        self.store = store
+
         guard let dev = MTLCreateSystemDefaultDevice(),
               let q = dev.makeCommandQueue() else {
             fatalError("Metal not available")
@@ -58,8 +87,10 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
             fatalError("Metal default library missing — Shaders.metal not compiled?")
         }
         guard
-            let vfn = lib.makeFunction(name: "spectrum_vertex"),
-            let lfn = lib.makeFunction(name: "line_fragment")
+            let barVfn = lib.makeFunction(name: "bar_vertex"),
+            let barFfn = lib.makeFunction(name: "bar_fragment"),
+            let lineVfn = lib.makeFunction(name: "spectrum_vertex"),
+            let lineFfn = lib.makeFunction(name: "line_fragment")
         else {
             fatalError("Spectrum shaders missing from Metal library")
         }
@@ -67,156 +98,193 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         self.commandQueue = q
 
         let format = MTLPixelFormat.bgra8Unorm
-        // 4x MSAA gives the line strip clean anti-aliased edges instead
-        // of staircased pixels. Each frame is barely 1024 line segments;
-        // the GPU cost is negligible vs the polish gained.
-        let sampleCount = 4
+        // No MSAA. Bars are axis-aligned rectangles with nothing to
+        // anti-alias, unlike the line strip this replaced.
+        func makePipeline(_ vfn: MTLFunction, _ ffn: MTLFunction) -> MTLRenderPipelineState {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = vfn
+            desc.fragmentFunction = ffn
+            desc.rasterSampleCount = 1
+            desc.colorAttachments[0].pixelFormat = format
+            desc.colorAttachments[0].isBlendingEnabled = true
+            desc.colorAttachments[0].rgbBlendOperation = .add
+            desc.colorAttachments[0].alphaBlendOperation = .add
+            desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            return (try? dev.makeRenderPipelineState(descriptor: desc))!
+        }
+        self.barPipeline = makePipeline(barVfn, barFfn)
+        self.linePipeline = makePipeline(lineVfn, lineFfn)
 
-        let lineDesc = MTLRenderPipelineDescriptor()
-        lineDesc.vertexFunction = vfn
-        lineDesc.fragmentFunction = lfn
-        lineDesc.rasterSampleCount = sampleCount
-        lineDesc.colorAttachments[0].pixelFormat = format
-        lineDesc.colorAttachments[0].isBlendingEnabled = true
-        lineDesc.colorAttachments[0].rgbBlendOperation = .add
-        lineDesc.colorAttachments[0].alphaBlendOperation = .add
-        lineDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        lineDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
-        lineDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        lineDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        self.linePipeline = (try? dev.makeRenderPipelineState(descriptor: lineDesc))!
-
-        self.topLineBuffer = dev.makeBuffer(length: 4096 * MemoryLayout<SIMD2<Float>>.stride, options: .storageModeShared)!
-        self.peakLineBuffer = dev.makeBuffer(length: 4096 * MemoryLayout<SIMD2<Float>>.stride, options: .storageModeShared)!
-        self.decorBuffer = dev.makeBuffer(length: 64 * MemoryLayout<SIMD2<Float>>.stride, options: .storageModeShared)!
+        self.barBuffer = dev.makeBuffer(
+            length: Self.maxBars * Self.vertsPerBar * MemoryLayout<BarVertex>.stride,
+            options: .storageModeShared)!
+        self.decorBuffer = dev.makeBuffer(
+            length: 2 * MemoryLayout<SIMD2<Float>>.stride,
+            options: .storageModeShared)!
 
         super.init(frame: .zero, device: dev)
 
         self.colorPixelFormat = format
-        self.sampleCount = sampleCount
-        self.preferredFramesPerSecond = 60
-        self.isPaused = false
-        self.enableSetNeedsDisplay = false
+        self.sampleCount = 1
+        // Draw on demand. The FFT arrives at 1-10 fps, so a 60 fps display link
+        // was up to 60× the necessary main-thread work — and it kept running
+        // when the view was off-screen.
+        self.isPaused = true
+        self.enableSetNeedsDisplay = true
         self.framebufferOnly = true
         // Transparent so the surrounding card colour shows through.
         self.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         self.layer.isOpaque = false
         self.delegate = self
+
+        buildDecor()
     }
 
     required init(coder: NSCoder) {
         fatalError("init(coder:) not used")
     }
 
+    deinit {
+        store.setFrameHandler(nil)
+    }
+
+    /// Detach from the store so a torn-down view stops being woken by frames.
+    func detach() {
+        store.setFrameHandler(nil)
+    }
+
+    // Redraw only while in the window hierarchy: navigating away should cost
+    // nothing at all.
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        attachIfVisible()
+    }
+
+    private func attachIfVisible() {
+        guard window != nil else {
+            store.setFrameHandler(nil)
+            return
+        }
+        store.setFrameHandler { [weak self] in
+            // setNeedsDisplay is main-thread only; the store signals off-main.
+            DispatchQueue.main.async { self?.setNeedsDisplay() }
+        }
+        // Paint once on appearance rather than waiting for the next FFT frame,
+        // which under heavy loss can be a second away.
+        setNeedsDisplay()
+    }
+
     // MARK: - MTKViewDelegate
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        setNeedsDisplay()
+    }
 
     func draw(in view: MTKView) {
         guard
-            let store,
             let drawable = currentDrawable,
             let descriptor = currentRenderPassDescriptor,
             let cmd = commandQueue.makeCommandBuffer(),
             let enc = cmd.makeRenderCommandEncoder(descriptor: descriptor)
         else { return }
 
-        let snap = store.snapshot()
-        let n = snap.binCount
-        if n < 2 {
-            enc.endEncoding()
-            cmd.present(drawable)
-            cmd.commit()
-            return
+        if buildBars() {
+            enc.setRenderPipelineState(barPipeline)
+            enc.setVertexBuffer(barBuffer, offset: 0, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: barVertexCount)
         }
 
-        // Margin at the top so the spectrum curve doesn't kiss the edge
-        // labels. yScale < 1.0 leaves a transparent strip up top.
-        let yScale: Float = 0.92
-
-        // --- Spectrum line ---
-        do {
-            let ptr = topLineBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: n)
-            for i in 0..<n {
-                let x = Float(i) / Float(n - 1)
-                let y = snap.smooth[i] * yScale
-                ptr[i] = SIMD2<Float>(x, y)
-            }
-            topLineCount = n
-        }
-
-        // --- Peak hold line ---
-        do {
-            let ptr = peakLineBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: n)
-            for i in 0..<n {
-                let x = Float(i) / Float(n - 1)
-                let y = snap.peak[i] * yScale
-                ptr[i] = SIMD2<Float>(x, y)
-            }
-            peakLineCount = n
-        }
-
-        // --- Decor (squelch + center marker) — only rebuild on change ---
-        if abs(squelchDb - lastSquelchDb) > 0.05 {
-            rebuildDecor(yScale: yScale)
-            lastSquelchDb = squelchDb
-        }
-
+        // Centre-frequency marker. The squelch line the old view drew is gone:
+        // levels are auto-ranged now (see SpectrumStore), so a threshold in
+        // absolute dBm no longer corresponds to a height on this axis. Squelch
+        // is still shown numerically and as the S-meter's tint threshold.
         enc.setRenderPipelineState(linePipeline)
-
-        // --- Peak hold (faint gray, drawn first so the live line sits on top) ---
-        enc.setVertexBuffer(peakLineBuffer, offset: 0, index: 0)
-        var peakColor = SIMD4<Float>(0.40, 0.45, 0.55, 0.45)
-        enc.setFragmentBytes(&peakColor, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
-        enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: peakLineCount)
-
-        // --- Spectrum line (deep blue, sharp) ---
-        enc.setVertexBuffer(topLineBuffer, offset: 0, index: 0)
-        var topColor = SIMD4<Float>(0.05, 0.35, 0.80, 1.0)
-        enc.setFragmentBytes(&topColor, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
-        enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: topLineCount)
-
-        // --- Draw decor segments ---
         enc.setVertexBuffer(decorBuffer, offset: 0, index: 0)
-        for seg in decorSegments {
-            var c = seg.color
-            enc.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
-            enc.drawPrimitives(type: .line, vertexStart: seg.start, vertexCount: seg.count)
-        }
+        var centerColor = SIMD4<Float>(0.55, 0.60, 0.70, 0.45)
+        enc.setFragmentBytes(&centerColor, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
+        enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: 2)
 
         enc.endEncoding()
         cmd.present(drawable)
         cmd.commit()
     }
 
-    private func rebuildDecor(yScale: Float) {
-        // Map squelchDb (-120..0) onto 0..1 then scale into the curve area.
-        let squelchY = max(0.0, min(1.0, (squelchDb + 120) / 120)) * yScale
+    // MARK: - Geometry
 
-        // Segment layout:
-        //   0..N : squelch dashed line (10 dashes = 20 verts)
-        //   N..N+2 : center crosshair (vertical, 2 verts)
-        let dashCount = 12
-        let dashVerts = dashCount * 2
-        let totalVerts = dashVerts + 2
-        let ptr = decorBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: totalVerts)
+    /// Fill barBuffer from the store. Returns false when there is nothing to draw.
+    private func buildBars() -> Bool {
+        let widthPoints = bounds.width
+        guard widthPoints > 0 else { return false }
 
-        // Squelch dashed line
-        for i in 0..<dashCount {
-            let t0 = Float(i * 2) / Float(dashCount * 2)
-            let t1 = Float(i * 2 + 1) / Float(dashCount * 2)
-            ptr[i * 2 + 0] = SIMD2<Float>(t0, squelchY)
-            ptr[i * 2 + 1] = SIMD2<Float>(t1, squelchY)
+        let count = min(max(Int(widthPoints / barPitch), 8), Self.maxBars)
+        if levels.count != count {
+            levels = Array(repeating: 0, count: count)
+            peaks = Array(repeating: 0, count: count)
         }
-        // Center crosshair
-        ptr[dashVerts + 0] = SIMD2<Float>(0.5, 0)
-        ptr[dashVerts + 1] = SIMD2<Float>(0.5, yScale)
+        guard store.readBars(level: &levels, peak: &peaks) else { return false }
 
-        decorSegments = [
-            // squelch, warm orange — pops on either light or dark
-            (start: 0, count: dashVerts, color: SIMD4<Float>(0.95, 0.45, 0.15, 0.95)),
-            // crosshair, dim ink — reads on white, fades on dark
-            (start: dashVerts, count: 2, color: SIMD4<Float>(0.15, 0.20, 0.30, 0.35)),
-        ]
+        let slot = 1 / Float(count)
+        let gap = slot * gapFraction
+        let center = count / 2
+
+        let ptr = barBuffer.contents().bindMemory(
+            to: BarVertex.self, capacity: Self.maxBars * Self.vertsPerBar)
+        var v = 0
+
+        func quad(x0: Float, x1: Float, y0: Float, y1: Float, color: SIMD4<Float>) {
+            let corners = [
+                SIMD2<Float>(x0, y0), SIMD2<Float>(x1, y0), SIMD2<Float>(x1, y1),
+                SIMD2<Float>(x0, y0), SIMD2<Float>(x1, y1), SIMD2<Float>(x0, y1),
+            ]
+            for c in corners {
+                ptr[v] = BarVertex(pos: c, color: color)
+                v += 1
+            }
+        }
+
+        for i in 0..<count {
+            let x0 = Float(i) * slot + gap * 0.5
+            let x1 = Float(i + 1) * slot - gap * 0.5
+            let level = levels[i]
+            let peak = peaks[i]
+
+            // Colour by level so activity reads without checking the height,
+            // with the tuned (centre) bar tinted so it's findable at a glance.
+            let color = i == center
+                ? SIMD4<Float>(0.95, 0.55, 0.20, 0.95)
+                : mix(low: SIMD4<Float>(0.20, 0.28, 0.42, 0.80),
+                      high: SIMD4<Float>(0.10, 0.55, 0.95, 1.00),
+                      t: level)
+
+            // A floor of one cap-height keeps empty bars visible as a baseline
+            // rather than vanishing entirely.
+            let top = max(level * yScale, peakCapHeight * 0.5)
+            quad(x0: x0, x1: x1, y0: 0, y1: top, color: color)
+
+            // Peak cap, only when it has separated from the bar itself.
+            let capBottom = peak * yScale - peakCapHeight
+            if capBottom > top {
+                quad(x0: x0, x1: x1,
+                     y0: capBottom, y1: peak * yScale,
+                     color: SIMD4<Float>(0.75, 0.80, 0.90, 0.55))
+            }
+        }
+
+        barVertexCount = v
+        return v > 0
+    }
+
+    private func mix(low: SIMD4<Float>, high: SIMD4<Float>, t: Float) -> SIMD4<Float> {
+        let k = min(max(t, 0), 1)
+        return low + (high - low) * k
+    }
+
+    private func buildDecor() {
+        let ptr = decorBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: 2)
+        ptr[0] = SIMD2<Float>(0.5, 0)
+        ptr[1] = SIMD2<Float>(0.5, yScale)
     }
 }

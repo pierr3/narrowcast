@@ -5,6 +5,10 @@ public enum DatagramType: UInt8 {
     case fft = 0x02
     case status = 0x03
     case seqMark = 0x04
+    /// Opus frame prefixed with a u16 sequence number. Same payload as `audio`
+    /// otherwise; the counter is what lets the decoder tell a lost packet from
+    /// a silent channel and spend the encoder's in-band FEC.
+    case audioSeq = 0x05
     case welcome = 0x31
     case authOK = 0x33
     case authFail = 0x34

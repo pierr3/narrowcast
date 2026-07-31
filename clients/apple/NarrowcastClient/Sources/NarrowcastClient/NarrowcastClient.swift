@@ -21,7 +21,9 @@ public actor NarrowcastClient {
 
     public enum Event: Sendable {
         case welcome(ServerInfo)
-        case audio(Data)
+        /// Opus packet plus its sequence number, when the server sends one.
+        /// nil seq means gaps can't be detected, so no FEC recovery downstream.
+        case audio(opus: Data, seq: UInt16?)
         case fft(bins: [UInt8])
         case status(smeter: Float, squelch: Float, mode: DemodMode, freq: UInt64, clientCount: UInt8?)
         case loss(LossTracker.Sample)
@@ -80,11 +82,17 @@ public actor NarrowcastClient {
     private var pumpTask: Task<Void, Never>?
     private var keepaliveTask: Task<Void, Never>?
 
+    /// Event buffer depth. Bounded for the same reason as the transport's
+    /// inbound stream: an unbounded buffer converts a consumer stall into
+    /// unbounded latency plus a catch-up burst, where dropping keeps playback
+    /// current on a path that already tolerates loss.
+    private static let eventDepth = 64
+
     public init(config: Config) {
         self.transport = QUICTransport(host: config.host, port: config.port, mode: config.mode)
         self.password = config.password
         var cont: AsyncStream<Event>.Continuation!
-        self.events = AsyncStream { c in cont = c }
+        self.events = AsyncStream(bufferingPolicy: .bufferingNewest(Self.eventDepth)) { c in cont = c }
         self.eventsContinuation = cont
     }
 
@@ -223,9 +231,9 @@ public actor NarrowcastClient {
                 welcomeWaiter = nil
                 eventsContinuation?.yield(.welcome(info))
 
-            case .audio(let opus):
+            case .audio(let opus, let seq):
                 lossTracker.recordReceived(.audio)
-                eventsContinuation?.yield(.audio(opus))
+                eventsContinuation?.yield(.audio(opus: opus, seq: seq))
 
             case .fft(let bins):
                 lossTracker.recordReceived(.fft)

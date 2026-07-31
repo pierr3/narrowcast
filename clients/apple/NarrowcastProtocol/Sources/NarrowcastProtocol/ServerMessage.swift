@@ -5,7 +5,10 @@ import Foundation
 // before fan-out, so the same type may arrive in two lengths — we tolerate
 // both.
 public enum ServerMessage: Sendable {
-    case audio(Data) // raw Opus packet
+    /// Raw Opus packet. `seq` is present only for DatagramAudioSeq (0x05);
+    /// a nil seq means the server is an older build that can't be gap-detected,
+    /// so the decoder falls back to plain decoding without FEC recovery.
+    case audio(opus: Data, seq: UInt16?)
     case fft(bins: [UInt8])
     case status(smeter: Float, squelch: Float, mode: DemodMode, freq: UInt64, clientCount: UInt8?)
     case seqMark(audioSent: UInt32, fftSent: UInt32, statusSent: UInt32)
@@ -21,7 +24,12 @@ public enum ServerMessage: Sendable {
 
         switch typeByte {
         case DatagramType.audio.rawValue:
-            return .audio(r.remainingBytes())
+            return .audio(opus: r.remainingBytes(), seq: nil)
+
+        case DatagramType.audioSeq.rawValue:
+            // [u16le seq][opus...]
+            guard let seq = try? r.u16LE() else { return nil }
+            return .audio(opus: r.remainingBytes(), seq: seq)
 
         case DatagramType.fft.rawValue:
             // [u16be numBins][u8 bins...]

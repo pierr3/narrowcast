@@ -48,15 +48,20 @@ public final class OpusDecoder {
         return Array(pcm.prefix(Int(n)))
     }
 
-    /// Reconstruct a missing frame from the previous packet's FEC payload.
-    /// Pass the LAST received packet here; libopus extracts the embedded
-    /// copy of the now-missing frame from it.
-    public func decodeFEC(previousPacket: Data) -> [Float]? {
+    /// Reconstruct a missing frame from the FEC payload of the packet that
+    /// FOLLOWS it.
+    ///
+    /// Opus in-band FEC puts a low-bitrate copy of frame N inside packet N+1,
+    /// so recovery needs the packet that arrived *after* the gap — pass the
+    /// packet you just received, before decoding it normally. (The previous
+    /// signature asked for the last packet received before the gap, which
+    /// contains no copy of the missing frame.)
+    public func decodeFEC(nextPacket: Data) -> [Float]? {
         var pcm = [Float](repeating: 0, count: frameSize)
-        let n = previousPacket.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> Int32 in
+        let n = nextPacket.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> Int32 in
             guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return -1 }
             return pcm.withUnsafeMutableBufferPointer { out in
-                opus_decode_float(decoder, base, Int32(previousPacket.count), out.baseAddress!, Int32(out.count), 1)
+                opus_decode_float(decoder, base, Int32(nextPacket.count), out.baseAddress!, Int32(out.count), 1)
             }
         }
         guard n > 0 else { return nil }

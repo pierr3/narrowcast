@@ -114,33 +114,7 @@ struct ListenView: View {
     }
 
     private var sMeter: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("S").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Text("\(Int(vm.sMeterDb)) dB").font(.caption).monospacedDigit()
-            }
-            // Server pushes ~20 status samples/sec; SwiftUI interpolates
-            // between them so the meter slides at display rate (60-120 fps)
-            // instead of stepping in 50 ms blocks. Peak-hold tick is an
-            // overlay positioned via GeometryReader so it tracks the bar
-            // width whatever the layout.
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    ProgressView(value: sMeterFraction(vm.sMeterDb))
-                        .progressViewStyle(.linear)
-                        .tint(vm.sMeterDb > vm.squelchDb ? .green : .gray)
-                        .animation(.easeOut(duration: 0.08), value: vm.sMeterDb)
-
-                    Rectangle()
-                        .fill(Color.orange)
-                        .frame(width: 2, height: 14)
-                        .offset(x: geo.size.width * sMeterFraction(vm.sMeterPeakDb) - 1, y: -1)
-                        .animation(.linear(duration: 0.08), value: vm.sMeterPeakDb)
-                }
-            }
-            .frame(height: 14)
-        }
+        SMeterView(meter: vm.meter, squelchDb: vm.squelchDb)
     }
 
     private var squelch: some View {
@@ -182,31 +156,18 @@ struct ListenView: View {
         }
     }
 
-    private var waterfall: some View {
-        WaterfallView(frames: vm.waterfallFrames) { frac in
-            // Tap maps to a bin-fraction; convert to freq offset from current
-            // center using the server-reported sample rate.
-            guard let info = vm.serverInfo, vm.freqHz > 0 else { return }
-            let sr = Double(info.sampleRate)
-            let offset = (Double(frac) - 0.5) * sr
-            let newHz = max(info.minHz, min(info.maxHz, UInt64(Int64(vm.freqHz) + Int64(offset))))
-            vm.setFrequency(newHz)
-        }
-    }
-
     private var spectrumPanel: some View {
-        // Spectrum sits below all controls. Renders FFT bins centered on
-        // tunedFreq, span = SDR sample rate. Edge labels use the
-        // server-reported sampleRate so the values stay correct if the
-        // SDR rate ever changes.
-        let span = Double(vm.serverInfo?.sampleRate ?? 2_400_000)
+        // Spectrum sits below all controls. Bars are centered on tunedFreq,
+        // span = SDR sample rate. Edge labels use the server-reported sampleRate
+        // so the values stay correct if the SDR rate changes.
+        let span = Double(vm.serverInfo?.sampleRate ?? 960_000)
         let centerMhz = Double(vm.freqHz) / 1_000_000
         let halfSpanMhz = span / 2_000_000
         return VStack(spacing: 4) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(Color(.secondarySystemBackground))
-                SpectrumView(store: vm.spectrumStore, squelchDb: vm.squelchDb)
+                SpectrumView(store: vm.spectrumStore)
                     .padding(.vertical, 4)
                     .padding(.horizontal, 2)
             }
@@ -234,12 +195,6 @@ struct ListenView: View {
                 .font(.system(size: 72))
         }
         .disabled(vm.state != .connected)
-    }
-
-    private func sMeterFraction(_ db: Float) -> Double {
-        // Map -120..0 dB → 0..1
-        let clamped = max(-120, min(0, db))
-        return Double((clamped + 120) / 120)
     }
 
     private func formatFreq(_ hz: UInt64) -> String {

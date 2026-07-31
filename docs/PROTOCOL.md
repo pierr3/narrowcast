@@ -25,14 +25,14 @@ Every datagram begins with a single **type byte** identifying the message. The r
 
 | Range       | Direction        | Meaning                    |
 | ----------- | ---------------- | -------------------------- |
-| `0x01–0x04` | server → client  | Streaming data + telemetry |
+| `0x01–0x05` | server → client  | Streaming data + telemetry |
 | `0x10–0x14` | client → server  | Tuning + adaptation control|
 | `0x20–0x21` | client → server  | Streaming gate (start/stop)|
 | `0x30–0x35` | mixed            | Handshake + auth           |
 
 ## Server → client datagrams
 
-### `0x01` Audio
+### `0x01` Audio (legacy)
 
 Encoded Opus packet (raw — no length prefix). One packet per encoded audio frame; frame durations are 20 ms by default.
 
@@ -42,11 +42,13 @@ Encoded Opus packet (raw — no length prefix). One packet per encoded audio fra
 +------+-------------------+
 ```
 
-The server adapts Opus bitrate (32 → 24 → 16 kbps) based on `CmdQualityReport` from the client. **16 kbps is a hard floor** — below that, voice quality drops below acceptable for the monitoring use case.
+Superseded by `0x05`, which is what the server emits by default. `0x01` remains for clients predating sequence numbers; run the server with `--audio-seq=false` to emit it.
+
+The server adapts Opus bitrate (32 → 24 → 20 → 16 kbps) based on `CmdQualityReport` from the client. **16 kbps is a hard floor** — below that, voice quality drops below acceptable for the monitoring use case.
 
 ### `0x02` FFT
 
-Down-sampled magnitude spectrum of the wideband IQ stream. The server emits at `--fftrate` fps (default 20), throttled down to 1 fps under heavy loss.
+Down-sampled magnitude spectrum of the wideband IQ stream. The server emits at `--fftrate` fps (default 10), throttled down to 1/10 of that under heavy loss.
 
 ```
 +------+-----------------+----------------+
@@ -54,16 +56,18 @@ Down-sampled magnitude spectrum of the wideband IQ stream. The server emits at `
 +------+-----------------+----------------+
 ```
 
-- `numBins` is the count that follows. With `--fftsize 1024`, this is 1024 bins.
-- Each bin is a dBFS magnitude mapped to `0..255` by `MagnitudeToU8` in `pkg/dsp/fft.go`. The mapping is `byte = clamp((dBFS + 120) * 255/120, 0, 255)`, so:
+- `numBins` is the count that follows: `--fftbins`, default 256. The FFT itself is `--fftsize` points (default 1024) and its output is **max-pooled** down to `numBins` by `MagnitudeToBins` in `pkg/dsp/fft.go`. Pooling uses max rather than mean so a carrier occupying a single FFT bin survives into its transmitted bin instead of being averaged into the noise floor.
+- Sending 1024 bins at 20 fps was ~20 KB/s, more than the entire uplink budget, and exceeded the usable datagram payload on reduced-MTU paths (where the send then failed silently and the spectrum simply never appeared). 256 bins at 10 fps is ~2.6 KB/s in a 259-byte datagram.
+- Each bin is a dBFS magnitude mapped to `0..255`: `byte = round(clamp((dBFS + 120) * 255/120, 0, 255))`, so:
   - `0` ≡ -120 dBFS or below
   - `255` ≡ 0 dBFS
 - The bin order is **DC-centered** (FFT-shifted server-side). Bin 0 is the lowest frequency in the captured passband, bin `numBins-1` is the highest, bin `numBins/2` is at the tuned center frequency.
-- The captured passband width equals the SDR sample rate (default 2.4 MHz).
+- The captured passband width equals the SDR sample rate (default 960 kHz).
+- Clients are expected to re-range these values for display; the absolute 120 dB scale leaves real signals occupying a small fraction of it (the iOS client auto-ranges from per-frame percentiles).
 
 ### `0x03` Status
 
-Periodic telemetry frame. Default rate 20 Hz.
+Periodic telemetry frame. Default rate 10 Hz. (It was 20 Hz; each frame costs the client a UI invalidation, which is main-thread work on a phone, and clients interpolate between samples anyway.)
 
 ```
 +------+----------------+----------------+----------+----------------+----------+
@@ -89,7 +93,24 @@ Quality-feedback anchor. Sent **once per second** by the server. Carries monoton
 
 All three counters are little-endian and reset to zero when the pipeline starts (typically on first `CmdStart`).
 
+They count datagrams **handed to the send queue**, including any the server later sheds locally when a link can't keep up (see `protocol.Writer`). That is deliberate: a datagram dropped at the server is real loss from the client's point of view and should drive the adaptation loop.
+
 The client should respond with a `CmdQualityReport` once it has measured a window worth of data (e.g. 2–5 seconds).
+
+### `0x05` Audio with sequence number
+
+The default audio form. Identical to `0x01` plus a 16-bit counter.
+
+```
++------+--------------+-------------------+
+| 0x05 | u16 seq LE   | opus packet bytes |
++------+--------------+-------------------+
+```
+
+- `seq` increments by one per Opus frame and wraps at 2^16 — about 22 minutes at 50 frames/s, so a gap diffed modulo 2^16 is never ambiguous.
+- The counter is what lets a client distinguish *packet lost* from *nothing transmitted*. On a gap it can call `opus_decode` with `decode_fec=1` on the packet that arrived **after** the gap, recovering the missing frame from the redundant copy the encoder embedded there — the encoder already spends ~20-25 % of its bitrate on that copy (`SetInBandFEC`), so without sequence numbers it was being paid for and thrown away.
+- `seq` does **not** advance while squelch is closed, so a closed-squelch silence is not mistaken for loss.
+- Servers emit either `0x01` or `0x05`, never both. Clients should handle both; unknown types must be ignored, so an old client against a new server goes silent rather than misbehaving — run the server with `--audio-seq=false` in that case.
 
 ## Client → server datagrams
 

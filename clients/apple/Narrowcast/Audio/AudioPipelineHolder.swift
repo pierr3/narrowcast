@@ -21,9 +21,9 @@ final class AudioPipelineHolder: @unchecked Sendable {
         old?.stop()
     }
 
-    func feed(_ opus: Data) {
+    func feed(_ opus: Data, seq: UInt16?) {
         let p = lock.withLock { $0 }
-        p?.feed(opus)
+        p?.feed(opus, seq: seq)
     }
 
     func stop() {

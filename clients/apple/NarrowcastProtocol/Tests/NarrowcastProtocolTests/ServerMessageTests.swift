@@ -83,6 +83,37 @@ final class ServerMessageTests: XCTestCase {
         XCTAssertEqual(s, 64)
     }
 
+    func testPlainAudioHasNoSequence() {
+        guard case .audio(let opus, let seq) = ServerMessage.decode(Data([0x01, 0xAA, 0xBB]))! else {
+            XCTFail("expected audio"); return
+        }
+        XCTAssertEqual(Array(opus), [0xAA, 0xBB])
+        XCTAssertNil(seq, "0x01 carries no sequence number, so gaps can't be detected")
+    }
+
+    func testSequencedAudioSplitsSeqFromPayload() {
+        // 0x05, seq=0x0102 LE, then the Opus bytes.
+        guard case .audio(let opus, let seq) = ServerMessage.decode(Data([0x05, 0x02, 0x01, 0xAA, 0xBB]))! else {
+            XCTFail("expected audio"); return
+        }
+        XCTAssertEqual(seq, 0x0102)
+        XCTAssertEqual(Array(opus), [0xAA, 0xBB], "seq must not leak into the Opus packet")
+    }
+
+    func testSequencedAudioRejectsTruncatedHeader() {
+        // A one-byte sequence number is malformed; decoding it as a payload
+        // would hand libopus a corrupt packet.
+        XCTAssertNil(ServerMessage.decode(Data([0x05, 0x02])))
+    }
+
+    func testSequencedAudioToleratesEmptyPayload() {
+        guard case .audio(let opus, let seq) = ServerMessage.decode(Data([0x05, 0x00, 0x00]))! else {
+            XCTFail("expected audio"); return
+        }
+        XCTAssertEqual(seq, 0)
+        XCTAssertTrue(opus.isEmpty)
+    }
+
     func testAuthOKAuthFail() {
         if case .authOK = ServerMessage.decode(Data([0x33]))! {} else { XCTFail() }
         if case .authFail = ServerMessage.decode(Data([0x34]))! {} else { XCTFail() }

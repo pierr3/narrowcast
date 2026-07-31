@@ -40,6 +40,21 @@ const (
 	// Payload: [uint32 audioSent][uint32 fftSent][uint32 statusSent]
 	// All counters are LE and reset to 0 when the pipeline starts.
 	DatagramSeqMark byte = 0x04
+
+	// DatagramAudioSeq carries an Opus frame tagged with a sequence number.
+	// Payload: [uint16 seq LE][raw Opus packet bytes]
+	//
+	// Identical to DatagramAudio except for the counter, which is what lets
+	// the decoder tell "packet lost" from "nothing transmitted": on a gap it
+	// can spend the in-band FEC copy the encoder already paid for (see
+	// pkg/audio/opus.go SetInBandFEC) instead of playing a silent hole.
+	// seq increments per Opus frame and wraps at 2^16 — ~22 minutes at 50
+	// frames/s, so a gap is always unambiguous when diffed modulo 2^16.
+	//
+	// Clients predating this type ignore it (unknown datagram types are
+	// dropped on both sides), so the server emits either this or
+	// DatagramAudio, never both. See the --audio-seq flag.
+	DatagramAudioSeq byte = 0x05
 )
 
 // --- Command types (reliable stream) ---
