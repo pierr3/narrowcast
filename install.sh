@@ -91,7 +91,10 @@ cp "/etc/letsencrypt/live/\$DOMAIN/privkey.pem"  /etc/narrowcast-relay/certs/ser
 chown narrowcast:narrowcast /etc/narrowcast-relay/certs/server.*
 chmod 644 /etc/narrowcast-relay/certs/server.crt
 chmod 600 /etc/narrowcast-relay/certs/server.key
-systemctl restart narrowcast-relay
+# Bounce the legacy single unit (if present) plus every templated
+# instance (narrowcast-relay@PORT) so all relays pick up the new cert.
+systemctl restart narrowcast-relay 2>/dev/null || true
+systemctl restart 'narrowcast-relay@*' 2>/dev/null || true
 HOOKEOF
             sudo chmod +x /etc/letsencrypt/renewal-hooks/post/narrowcast-relay.sh
             echo "==> Cert in place + renewal hook installed."
