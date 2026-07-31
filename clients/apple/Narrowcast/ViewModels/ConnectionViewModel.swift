@@ -48,6 +48,23 @@ final class ConnectionViewModel: ObservableObject {
     @Published var connectedServerId: UUID?
     @Published var lastLoss: LossTracker.Sample?
 
+    /// Measured round trip over the whole path (phone → relay → Pi → back).
+    @Published var rttMs: Int?
+    /// Audio sitting in the local jitter buffer, in ms. Sampled alongside the
+    /// RTT so both come from the same instant.
+    @Published var bufferMs: Int?
+
+    /// End-to-end audio delay estimate: one network hop, the jitter buffer, and
+    /// the server's 20 ms DSP block. Half the RTT is the honest figure for a
+    /// one-way path — the reply leg isn't part of the audio's journey.
+    var audioLatencyMs: Int? {
+        guard let bufferMs else { return nil }
+        let network = (rttMs ?? 0) / 2
+        return network + bufferMs + Self.serverBlockMs
+    }
+
+    private static let serverBlockMs = 20
+
     // Stable name for lock-screen Now Playing artist field. Captured at
     // connect() time so we don't need to thread ServerStore in here.
     private var connectedServerName: String = ""
@@ -174,9 +191,14 @@ final class ConnectionViewModel: ObservableObject {
         gainSendTask = nil
         pipelineHolder.stop()
         connectedServerId = nil
-        // Don't leave a stale needle and spectrum behind on the next connect.
+        // Don't leave a stale needle, spectrum or readout behind on reconnect.
         meter.reset()
         spectrumStore.reset()
+        rttMs = nil
+        bufferMs = nil
+        lastLoss = nil
+        pendingSquelch = nil
+        pendingFreq = nil
         nowPlaying.deactivate()
         let c = client
         client = nil
@@ -208,7 +230,8 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     func setFrequency(_ hz: UInt64) {
-        freqHz = hz // optimistic; may be reconciled by a status frame
+        freqHz = hz // optimistic; reconciled once the server echoes it back
+        pendingFreq = PendingEdit(hz)
         refreshNowPlaying()
         Task { try? await client?.send(.setFrequency(hz: hz)) }
     }
@@ -230,8 +253,42 @@ final class ConnectionViewModel: ObservableObject {
     private var gainSendTask: Task<Void, Never>?
     private static let sliderDebounceNs: UInt64 = 150_000_000
 
+    /// Values the user just changed locally, awaiting the server's echo.
+    ///
+    /// Status frames arrive at 10 Hz carrying whatever the server last applied.
+    /// Right after a local change that echo is stale by construction — the send
+    /// is debounced 150 ms, then there's a round trip — so applying it drags the
+    /// control backwards under the user's finger. That's the squelch slider's
+    /// rubber-banding. Park the local value here instead and ignore echoes until
+    /// one matches it, with a timeout in case the command was lost.
+    private struct PendingEdit<T: Equatable> {
+        let value: T
+        let deadline: CFTimeInterval
+
+        init(_ value: T, timeout: TimeInterval = 3) {
+            self.value = value
+            self.deadline = CACurrentMediaTime() + timeout
+        }
+    }
+
+    private var pendingSquelch: PendingEdit<Float>?
+    private var pendingFreq: PendingEdit<UInt64>?
+
+    /// Whether a server-reported value should be applied to the UI. Clears the
+    /// pending edit once the server agrees (or the wait times out), so normal
+    /// server-driven updates resume.
+    private func accept<T: Equatable>(_ serverValue: T, pending: inout PendingEdit<T>?) -> Bool {
+        guard let p = pending else { return true }
+        if serverValue == p.value || CACurrentMediaTime() > p.deadline {
+            pending = nil
+            return true
+        }
+        return false
+    }
+
     func setSquelch(_ db: Float) {
         squelchDb = db
+        pendingSquelch = PendingEdit(db)
         squelchSendTask?.cancel()
         squelchSendTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: Self.sliderDebounceNs)
@@ -378,7 +435,9 @@ final class ConnectionViewModel: ObservableObject {
             // guard each assignment: an unconditional write to a @Published
             // property publishes whether or not the value moved, and at 10 Hz
             // that is a pile of pointless SwiftUI invalidations.
-            if q != squelchDb { squelchDb = q }
+            if accept(q, pending: &pendingSquelch), q != squelchDb {
+                squelchDb = q
+            }
 
             // Captured before any mutation below: the old code read prevMode
             // after assigning mode, so it always compared equal and lock-screen
@@ -396,7 +455,7 @@ final class ConnectionViewModel: ObservableObject {
             // Older Pi builds emit status without a freq field, decoded as 0.
             // Don't let that overwrite the optimistic local value the user
             // just set via tap-to-tune or the freq sheet.
-            if f != 0, f != freqHz {
+            if f != 0, accept(f, pending: &pendingFreq), f != freqHz {
                 freqHz = f
             }
             if let cc, cc != clientCount { clientCount = cc }
@@ -411,6 +470,12 @@ final class ConnectionViewModel: ObservableObject {
 
         case .loss(let sample):
             lastLoss = sample
+
+        case .rtt(let seconds):
+            rttMs = Int((seconds * 1000).rounded())
+            // Sampled here rather than on a timer of its own: both numbers then
+            // describe the same instant, and 0.5 Hz is plenty for a readout.
+            bufferMs = pipelineHolder.latency.map { Int(($0.seconds * 1000).rounded()) }
 
         case .audio, .fft, .unknown:
             // Audio + FFT handled in the pump directly.

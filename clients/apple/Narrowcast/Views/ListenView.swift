@@ -56,6 +56,9 @@ struct ListenView: View {
             Circle().fill(stateColor).frame(width: 10, height: 10)
             Text(stateLabel).font(.caption).foregroundStyle(.secondary)
             Spacer()
+            if let latency = vm.audioLatencyMs {
+                LatencyBadge(audioMs: latency, rttMs: vm.rttMs)
+            }
             if let loss = vm.lastLoss {
                 LossBadge(sample: loss)
             }
@@ -117,18 +120,46 @@ struct ListenView: View {
         SMeterView(meter: vm.meter, squelchDb: vm.squelchDb)
     }
 
+    /// Squelch fine step. The slider is continuous, but 120 dB across a phone's
+    /// width is ~0.34 dB per point, so precise values need buttons. 0.5 dB is
+    /// about as fine as is meaningful — the noise floor itself wanders more than
+    /// that between status frames.
+    private static let squelchStep: Float = 0.5
+
     private var squelch: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text("Squelch").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Text("\(Int(vm.squelchDb)) dB").font(.caption).monospacedDigit()
+                // One decimal: the value was always fractional, the readout just
+                // hid it by rounding to Int.
+                Text(String(format: "%.1f dB", vm.squelchDb))
+                    .font(.caption).monospacedDigit()
             }
-            Slider(value: Binding(
-                get: { Double(vm.squelchDb) },
-                set: { vm.setSquelch(Float($0)) }
-            ), in: -120...0)
+            HStack(spacing: 10) {
+                squelchNudge(-Self.squelchStep, icon: "minus")
+                Slider(value: Binding(
+                    get: { Double(vm.squelchDb) },
+                    set: { vm.setSquelch(Float($0)) }
+                ), in: -120...0)
+                squelchNudge(Self.squelchStep, icon: "plus")
+            }
         }
+    }
+
+    private func squelchNudge(_ delta: Float, icon: String) -> some View {
+        Button {
+            vm.setSquelch(min(0, max(-120, vm.squelchDb + delta)))
+        } label: {
+            Image(systemName: icon)
+                .font(.caption.weight(.semibold))
+                .frame(width: 30, height: 30)
+                .background(Color(.tertiarySystemFill), in: .circle)
+        }
+        .buttonStyle(.plain)
+        // Hold to keep stepping, for walking the threshold onto a weak signal.
+        .buttonRepeatBehavior(.enabled)
+        .disabled(vm.state != .connected)
     }
 
     @ViewBuilder
@@ -201,6 +232,41 @@ struct ListenView: View {
         if hz == 0 { return "—" }
         let mhz = Double(hz) / 1_000_000
         return String(format: "%.3f MHz", mhz)
+    }
+}
+
+// LatencyBadge shows how far behind reality the audio is, which is the number a
+// listener actually feels, with the network round trip alongside it so a slow
+// link can be told apart from a deep jitter buffer.
+struct LatencyBadge: View {
+    let audioMs: Int
+    let rttMs: Int?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "timer").font(.caption2)
+            Text("\(audioMs) ms")
+                .font(.caption2.monospacedDigit())
+            if let rttMs {
+                Text("· \(rttMs)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(Color(.tertiarySystemBackground)))
+    }
+
+    /// Thresholds match what the audio path allows: the jitter buffer sheds
+    /// above 400 ms, so anything past that is a struggling link, not buffering.
+    private var color: Color {
+        switch audioMs {
+        case ..<250:  return .secondary
+        case ..<500:  return .yellow
+        default:      return .red
+        }
     }
 }
 

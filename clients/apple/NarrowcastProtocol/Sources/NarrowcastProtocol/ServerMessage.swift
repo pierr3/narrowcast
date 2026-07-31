@@ -12,6 +12,10 @@ public enum ServerMessage: Sendable {
     case fft(bins: [UInt8])
     case status(smeter: Float, squelch: Float, mode: DemodMode, freq: UInt64, clientCount: UInt8?)
     case seqMark(audioSent: UInt32, fftSent: UInt32, statusSent: UInt32)
+    /// Echo of a token we sent in a ping. Tokens sent by *other* clients also
+    /// arrive here, because the relay fans every server datagram out to
+    /// everyone — the receiver must check the token is one of its own.
+    case pong(token: UInt32)
     case welcome(version: UInt8, minHz: UInt64, maxHz: UInt64, sampleRate: Float)
     case authOK
     case authFail
@@ -55,6 +59,10 @@ public enum ServerMessage: Sendable {
             guard let f = try? r.u32LE() else { return nil }
             guard let s = try? r.u32LE() else { return nil }
             return .seqMark(audioSent: a, fftSent: f, statusSent: s)
+
+        case DatagramType.pong.rawValue:
+            guard let token = try? r.u32LE() else { return nil }
+            return .pong(token: token)
 
         case DatagramType.welcome.rawValue:
             guard let v = try? r.u8() else { return nil }

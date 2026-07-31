@@ -444,6 +444,17 @@ func handleClient(ctx context.Context, conn quic.Connection, state *serverState)
 				fftLossPct:   payload[1],
 			})
 
+		case protocol.CmdPing:
+			// Echo the token verbatim; the client times the round trip. Cheap
+			// enough to answer unconditionally (5 B in, 5 B out, ~0.5 Hz).
+			if len(payload) < 4 {
+				continue
+			}
+			pong := make([]byte, 5)
+			pong[0] = protocol.DatagramPong
+			copy(pong[1:], payload[:4])
+			w.Send(pong)
+
 		case protocol.CmdStart:
 			if listening {
 				continue

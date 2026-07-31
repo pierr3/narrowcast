@@ -25,8 +25,8 @@ Every datagram begins with a single **type byte** identifying the message. The r
 
 | Range       | Direction        | Meaning                    |
 | ----------- | ---------------- | -------------------------- |
-| `0x01–0x05` | server → client  | Streaming data + telemetry |
-| `0x10–0x14` | client → server  | Tuning + adaptation control|
+| `0x01–0x06` | server → client  | Streaming data + telemetry |
+| `0x10–0x15` | client → server  | Tuning + adaptation control|
 | `0x20–0x21` | client → server  | Streaming gate (start/stop)|
 | `0x30–0x35` | mixed            | Handshake + auth           |
 
@@ -112,6 +112,24 @@ The default audio form. Identical to `0x01` plus a 16-bit counter.
 - `seq` does **not** advance while squelch is closed, so a closed-squelch silence is not mistaken for loss.
 - Servers emit either `0x01` or `0x05`, never both. Clients should handle both; unknown types must be ignored, so an old client against a new server goes silent rather than misbehaving — run the server with `--audio-seq=false` in that case.
 
+### `0x06` Pong
+
+Echo of a `CmdPing` token, so the client can measure round-trip time over the
+whole path — phone → relay → Pi and back — rather than to the relay host.
+
+```
++------+----------------+
+| 0x06 | u32 token LE   |
++------+----------------+
+```
+
+- The token is opaque to the server, which copies the four bytes back unchanged
+  and holds no per-ping state.
+- The relay fans every server→client datagram out to **all** clients, so a pong
+  answering one phone reaches the others too. Clients must therefore track their
+  outstanding tokens and ignore any pong they didn't ask for; a client that
+  timed its RTT from someone else's pong would report nonsense.
+
 ## Client → server datagrams
 
 ### `0x10` SetFrequency
@@ -166,7 +184,24 @@ Loss measurement reported by the client.
 
 - Loss percentages are 0–100, computed as `100 * (sent - received) / sent` over the most recent window.
 - `windowMs` is the duration of the window in milliseconds (typically 1000–5000).
-- Reports are advisory. The server uses them to step Opus bitrate (32 → 24 → 16 kbps), FFT rate (20 → 1 fps), and Opus FEC redundancy. A client that never reports stays at full quality.
+- Reports are advisory. The server uses them to step Opus bitrate (32 → 24 → 20 → 16 kbps), FFT rate (down to 1/10 of the configured rate), and Opus FEC redundancy. A client that never reports stays at full quality.
+
+### `0x15` Ping
+
+Round-trip probe. The server replies with `0x06` Pong carrying the same token.
+
+```
++------+----------------+
+| 0x15 | u32 token LE   |
++------+----------------+
+```
+
+- The token is chosen by the client and only has to be unique among that
+  client's outstanding pings — random works. See `0x06` for why matching it
+  matters when a relay is in the path.
+- The iOS client probes every 2 s and reports the result alongside its jitter
+  buffer depth, which together explain a laggy stream: a large RTT means the
+  link, a large buffer means local queueing.
 
 ### `0x20` Start / `0x21` Stop
 

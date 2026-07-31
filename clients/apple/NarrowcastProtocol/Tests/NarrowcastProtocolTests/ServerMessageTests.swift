@@ -114,6 +114,27 @@ final class ServerMessageTests: XCTestCase {
         XCTAssertTrue(opus.isEmpty)
     }
 
+    func testPongRoundTripsPingToken() {
+        // The token must survive verbatim, or the client can't match a reply to
+        // its own probe — and with relay fan-out it receives other clients' too.
+        let token: UInt32 = 0xDEADBEEF
+        let encoded = ClientMessage.ping(token: token).encode()
+        XCTAssertEqual(encoded.first, CommandType.ping.rawValue)
+
+        // Server echoes the 4 payload bytes behind a pong type byte.
+        var pong = Data([DatagramType.pong.rawValue])
+        pong.append(encoded.dropFirst())
+
+        guard case .pong(let got) = ServerMessage.decode(pong)! else {
+            XCTFail("expected pong"); return
+        }
+        XCTAssertEqual(got, token)
+    }
+
+    func testPongRejectsTruncatedToken() {
+        XCTAssertNil(ServerMessage.decode(Data([DatagramType.pong.rawValue, 0x01, 0x02])))
+    }
+
     func testAuthOKAuthFail() {
         if case .authOK = ServerMessage.decode(Data([0x33]))! {} else { XCTFail() }
         if case .authFail = ServerMessage.decode(Data([0x34]))! {} else { XCTFail() }

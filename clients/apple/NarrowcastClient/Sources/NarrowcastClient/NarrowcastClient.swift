@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 import NarrowcastProtocol
 
 // NarrowcastClient is the high-level API consumed by the UI. It owns a
@@ -27,6 +28,8 @@ public actor NarrowcastClient {
         case fft(bins: [UInt8])
         case status(smeter: Float, squelch: Float, mode: DemodMode, freq: UInt64, clientCount: UInt8?)
         case loss(LossTracker.Sample)
+        /// Measured round-trip time over the full path to the radio.
+        case rtt(TimeInterval)
         case unknown(typeByte: UInt8)
         case disconnected
     }
@@ -81,6 +84,13 @@ public actor NarrowcastClient {
     private var welcomeWaiter: OneShot<ServerInfo>?
     private var pumpTask: Task<Void, Never>?
     private var keepaliveTask: Task<Void, Never>?
+    private var pingTask: Task<Void, Never>?
+
+    /// Outstanding ping tokens and when they were sent. Entries are removed on
+    /// reply and pruned on timeout, so a lossy link can't grow this forever.
+    private var pings: [UInt32: CFTimeInterval] = [:]
+    private static let pingInterval: UInt64 = 2_000_000_000
+    private static let pingTimeout: CFTimeInterval = 10
 
     /// Event buffer depth. Bounded for the same reason as the transport's
     /// inbound stream: an unbounded buffer converts a consumer stall into
@@ -174,6 +184,7 @@ public actor NarrowcastClient {
             // settle; Apple's stack occasionally rejects rapid
             // post-handshake sends with EINVAL on the simulator.
             startKeepalive()
+            startPinging()
             return info
         } catch {
             retry.cancel()
@@ -192,6 +203,29 @@ public actor NarrowcastClient {
         }
     }
 
+    /// Round-trip probe every 2 s. Measures the whole path the audio takes —
+    /// phone → relay → Pi and back — which is the number that explains a
+    /// laggy-feeling stream, unlike a ping to the relay's host.
+    private func startPinging() {
+        pingTask?.cancel()
+        pingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.sendPing()
+                try? await Task.sleep(nanoseconds: Self.pingInterval)
+            }
+        }
+    }
+
+    private func sendPing() async {
+        let token = UInt32.random(in: .min ... .max)
+        let now = CACurrentMediaTime()
+        pings[token] = now
+        // Drop probes that never came back, so loss doesn't leak memory.
+        pings = pings.filter { now - $0.value < Self.pingTimeout }
+        try? await transport.send(ClientMessage.ping(token: token).encode())
+    }
+
     public func send(_ message: ClientMessage) async throws {
         try await transport.send(message.encode())
     }
@@ -199,6 +233,9 @@ public actor NarrowcastClient {
     public func close() async {
         keepaliveTask?.cancel()
         keepaliveTask = nil
+        pingTask?.cancel()
+        pingTask = nil
+        pings.removeAll()
         pumpTask?.cancel()
         pumpTask = nil
         await transport.close()
@@ -256,6 +293,13 @@ public actor NarrowcastClient {
                         windowMs: sample.windowMs
                     )
                     try? await transport.send(report.encode())
+                }
+
+            case .pong(let token):
+                // Tokens from other clients arrive here too (the relay fans
+                // server datagrams out to everyone), so only ours count.
+                if let sentAt = pings.removeValue(forKey: token) {
+                    eventsContinuation?.yield(.rtt(CACurrentMediaTime() - sentAt))
                 }
 
             case .unknown(let t):

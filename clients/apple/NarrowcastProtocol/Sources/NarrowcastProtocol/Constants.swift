@@ -9,6 +9,8 @@ public enum DatagramType: UInt8 {
     /// otherwise; the counter is what lets the decoder tell a lost packet from
     /// a silent channel and spend the encoder's in-band FEC.
     case audioSeq = 0x05
+    /// Echo of a ping token, for round-trip timing.
+    case pong = 0x06
     case welcome = 0x31
     case authOK = 0x33
     case authFail = 0x34
@@ -20,6 +22,7 @@ public enum CommandType: UInt8 {
     case setSquelch = 0x12
     case setGain = 0x13
     case qualityReport = 0x14
+    case ping = 0x15
     case start = 0x20
     case stop = 0x21
     case hello = 0x30

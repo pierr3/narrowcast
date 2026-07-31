@@ -55,6 +55,16 @@ const (
 	// dropped on both sides), so the server emits either this or
 	// DatagramAudio, never both. See the --audio-seq flag.
 	DatagramAudioSeq byte = 0x05
+
+	// DatagramPong echoes a CmdPing token back unchanged so the client can
+	// measure round-trip time over the full path (phone → relay → Pi and
+	// back). Payload: [uint32 token LE] — the same bytes the client sent.
+	//
+	// The token exists because the relay fans every server→client datagram out
+	// to all clients: a pong destined for one phone reaches the others too, and
+	// they must recognise it as not theirs. Clients keep their outstanding
+	// tokens and ignore any pong they didn't ask for.
+	DatagramPong byte = 0x06
 )
 
 // --- Command types (reliable stream) ---
@@ -87,6 +97,12 @@ const (
 	//
 	// Payload: [uint8 audioLossPct][uint8 fftLossPct][uint16 windowMs]
 	CmdQualityReport byte = 0x14
+
+	// CmdPing asks the server to echo a token back as DatagramPong, letting the
+	// client measure round-trip time. The token is opaque to the server —
+	// clients pick it however they like and match it against their outstanding
+	// pings. Payload: [uint32 token LE]
+	CmdPing byte = 0x15
 
 	// CmdStart begins streaming.
 	// Payload: none.

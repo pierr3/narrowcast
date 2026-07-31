@@ -73,6 +73,9 @@ final class AudioPipeline: @unchecked Sendable {
         }
     }
 
+    /// Current playback backlog in seconds, plus packets shed to bound it.
+    var latency: (seconds: Double, droppedPackets: Int) { player.latency }
+
     func setMuted(_ muted: Bool) {
         mutedFlag.withLock { $0 = muted }
         if muted { player.stop() }  // engine.stop() drains and silences

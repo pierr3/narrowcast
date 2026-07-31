@@ -44,8 +44,12 @@ The relay listens on **UDP/443** (QUIC standard port; survives more hostile fire
 
 Single QUIC connection per peer; **datagrams for everything** — commands, audio, FFT, telemetry. There are no reliable streams used for runtime data. See `pkg/protocol/protocol.go` for the canonical list. Two type-byte ranges:
 
-- `0x01–0x05` server→client data (`Audio`, `FFT`, `Status`, `SeqMark`, `AudioSeq`)
-- `0x10–0x35` commands (`SetFrequency`, `SetMode`, `SetSquelch`, `SetGain`, `QualityReport`, `Start`, `Stop`, `Hello`, `Welcome`, auth)
+- `0x01–0x06` server→client data (`Audio`, `FFT`, `Status`, `SeqMark`, `AudioSeq`, `Pong`)
+- `0x10–0x35` commands (`SetFrequency`, `SetMode`, `SetSquelch`, `SetGain`, `QualityReport`, `Ping`, `Start`, `Stop`, `Hello`, `Welcome`, auth)
+
+Relay fan-out sends every server→client datagram to **every** client, so any
+per-client reply needs a token the requester can recognise — that's why `Ping`
+carries one and clients ignore pongs they didn't ask for.
 
 When extending the protocol: assign a new type byte, document the payload layout in a comment above the constant, ensure unknown types are silently ignored on both sides (older clients/relays must keep working). The relay forwards datagrams it doesn't recognize unchanged.
 

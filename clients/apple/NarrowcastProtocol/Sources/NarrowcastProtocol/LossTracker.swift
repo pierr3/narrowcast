@@ -39,7 +39,7 @@ public final class LossTracker: @unchecked Sendable {
         case .audio, .audioSeq: receivedSinceStart.audio &+= 1
         case .fft:              receivedSinceStart.fft &+= 1
         case .status:           receivedSinceStart.status &+= 1
-        case .seqMark, .welcome, .authOK, .authFail:
+        case .seqMark, .pong, .welcome, .authOK, .authFail:
             break
         }
     }

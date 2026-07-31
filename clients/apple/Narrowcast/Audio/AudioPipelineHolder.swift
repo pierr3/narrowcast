@@ -35,6 +35,11 @@ final class AudioPipelineHolder: @unchecked Sendable {
         old?.stop()
     }
 
+    /// Playback backlog of the current pipeline, or nil if there isn't one.
+    var latency: (seconds: Double, droppedPackets: Int)? {
+        lock.withLock { $0 }?.latency
+    }
+
     /// Pause local playback (keeps the decoder + engine attached, just
     /// stops feeding incoming Opus packets to the player).
     func pause() {

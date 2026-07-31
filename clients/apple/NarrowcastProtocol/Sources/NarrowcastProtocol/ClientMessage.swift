@@ -12,6 +12,9 @@ public enum ClientMessage: Sendable {
     case setSquelch(dBm: Float)
     case setGain(dB: Float) // 0 = auto
     case qualityReport(audioLossPct: UInt8, fftLossPct: UInt8, windowMs: UInt16)
+    /// Round-trip probe. The server echoes `token` back as a pong; the token is
+    /// opaque to it, so the client can use it to match the reply to the send.
+    case ping(token: UInt32)
 
     public func encode() -> Data {
         var w = ByteWriter()
@@ -43,6 +46,9 @@ public enum ClientMessage: Sendable {
             w.u8(a)
             w.u8(f)
             w.u16LE(ms)
+        case .ping(let token):
+            w.u8(CommandType.ping.rawValue)
+            w.u32LE(token)
         }
         return w.data
     }

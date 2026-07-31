@@ -152,7 +152,9 @@ QUIC over UDP, TLS 1.3, single port. Datagrams for everything — commands, audi
 | `0x11` setmode| client→server  | `[u8 mode]`                                       |
 | `0x12` squelch| client→server  | `[f32 dBm]`                                       |
 | `0x13` setgain| client→server  | `[f32 dB]` (0 = auto)                             |
+| `0x06` pong   | server→client  | `[u32 token]` — echo of a ping, for RTT timing     |
 | `0x14` quality| client→server  | `[u8 audioLossPct][u8 fftLossPct][u16 windowMs]`  |
+| `0x15` ping   | client→server  | `[u32 token]`                                     |
 | `0x20` start  | client→server  | (none)                                            |
 | `0x21` stop   | client→server  | (none)                                            |
 | `0x30` hello  | client→server  | `[u8 protoVer]`                                   |
