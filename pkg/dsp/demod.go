@@ -264,6 +264,12 @@ func (a *AGC) Reset() {
 	a.envLevel = 0.001
 }
 
+// Restart is a no-op for FM. Demodulated FM level is set by the transmitter's
+// deviation, not by how far away it is, so consecutive transmissions arrive at
+// comparable levels and there is nothing to re-converge on — unlike AM, where
+// the audio amplitude *is* the signal amplitude.
+func (a *AGC) Restart() {}
+
 // AudioAGC is a post-demodulation AGC with hang-time and noise-floor freeze.
 //
 // Designed for AM/SSB where transmissions are bursty: a regular AGC ramps
@@ -271,40 +277,94 @@ func (a *AGC) Reset() {
 // of the next transmission while attack catches up. AudioAGC instead:
 //
 //   - Tracks a fast-attack / slow-release envelope.
-//   - When the envelope falls below minMagnitude (dead air), gain is FROZEN.
-//     No noise amplification, no pumping.
 //   - When a new transmission arrives, attack pulls gain down immediately
 //     and arms a hang counter.
-//   - Decay only proceeds after the hang counter expires AND the envelope
-//     stays above minMagnitude. This prevents pumping on speech dynamics.
+//   - Decay only proceeds after the hang counter expires, which is what stops
+//     it pumping on the pauses between words.
+//
+// It deliberately does NOT decide for itself whether a signal is present. It
+// used to, by freezing gain whenever the envelope fell below an absolute floor,
+// and that floor was a bug: every level in this chain scales with the RF gain
+// setting, so dropping the tuner from maximum to a sane 20 dB put the envelope
+// permanently underneath it. The AGC then froze at unity gain on a small signal
+// and could never recover, because the branch that raises gain was exactly the
+// one being skipped. Audible as "I fixed the hiss and now I can't hear anything
+// even at full volume".
+//
+// Signal presence is the squelch's job, decided on channel power before
+// demodulation, and the pipeline runs this only while that gate is open. One
+// detector, on the one quantity that doesn't move when you touch the RF gain.
 type AudioAGC struct {
-	target       float64
-	attack       float64
-	decay        float64
-	minMagnitude float64
-	hangSamples  int
-	hangCounter  int
-	envelope     float64
-	gain         float64
+	target      float64
+	attack      float64
+	decay       float64
+	maxGain     float64
+	hangSamples int
+	hangCounter int
+	envelope    float64
+	gain        float64
+
+	// Fast-converge window opened by Restart, in samples.
+	fastSamples int
+	fastCounter int
 }
+
+// restartFastConvergeMs is how long a new transmission gets to settle at attack
+// speed in both directions.
+//
+// Hang time is right in the middle of a transmission — it stops the gain
+// chasing the pauses between words — but wrong at the start of one, because
+// consecutive transmissions come from completely different stations. An
+// aircraft overhead and a distant ground controller can differ by 20 dB or
+// more, and the gain left over from the loud one makes the quiet one nearly
+// inaudible for as long as hang plus decay takes. Restarting at each squelch
+// opening lets the level find the new station straight away.
+const restartFastConvergeMs = 150
+
+// AMAGCTarget is the output peak amplitude the AM chain aims for, ≈ -8 dBFS.
+//
+// It was 0.17 (-15 dBFS), which left the audio quiet enough that a phone at
+// full volume still struggled — a 7 dB giveaway before the listener's volume
+// control gets a say. The envelope follower tracks peaks, so this is a peak
+// target and 0.4 keeps 8 dB of headroom against the hard clip at full scale.
+const AMAGCTarget = 0.4
+
+// maxAudioAGCGain caps the AGC at 60 dB. Enough to lift a weak but genuinely
+// present signal to a usable level, bounded so that a near-silent input can't
+// wind the gain somewhere absurd and make the next real transmission arrive as
+// a wall of clipping.
+const maxAudioAGCGain = 1000.0
 
 // NewAudioAGC creates a hang-time AGC.
 //
-//	target       — desired output amplitude (linear, e.g., 0.17 ≈ -15 dBFS)
-//	attack       — coefficient (0..1), e.g., 0.1 (fast)
-//	decay        — coefficient (0..1), e.g., 0.001 (slow)
-//	hangMs       — gain-hold time after signal drops, e.g., 500 ms
-//	sampleRate   — audio sample rate (Hz)
-//	minMagnitude — envelope floor below which gain is frozen, e.g., 0.02
-func NewAudioAGC(target, attack, decay, hangMs, sampleRate, minMagnitude float64) *AudioAGC {
-	return &AudioAGC{
-		target:       target,
-		attack:       attack,
-		decay:        decay,
-		minMagnitude: minMagnitude,
-		hangSamples:  int(hangMs * sampleRate / 1000.0),
-		gain:         1.0,
+//	target     — desired output peak amplitude (linear, e.g., 0.4 ≈ -8 dBFS)
+//	attack     — coefficient (0..1), e.g., 0.1 (fast)
+//	decay      — coefficient (0..1), e.g., 0.001 (slow)
+//	hangMs     — gain-hold time after signal drops, e.g., 500 ms
+//	sampleRate — audio sample rate (Hz)
+//	maxGain    — ceiling on gain; 0 selects maxAudioAGCGain
+func NewAudioAGC(target, attack, decay, hangMs, sampleRate, maxGain float64) *AudioAGC {
+	if maxGain <= 0 {
+		maxGain = maxAudioAGCGain
 	}
+	return &AudioAGC{
+		target:      target,
+		attack:      attack,
+		decay:       decay,
+		maxGain:     maxGain,
+		hangSamples: int(hangMs * sampleRate / 1000.0),
+		fastSamples: int(restartFastConvergeMs * sampleRate / 1000.0),
+		gain:        1.0,
+	}
+}
+
+// Restart marks the beginning of a new transmission, letting the gain converge
+// on the new station's level immediately instead of easing off the previous
+// one's. See restartFastConvergeMs.
+func (a *AudioAGC) Restart() {
+	a.envelope = 0
+	a.hangCounter = 0
+	a.fastCounter = a.fastSamples
 }
 
 // Process applies the AGC in-place.
@@ -319,27 +379,27 @@ func (a *AudioAGC) Process(samples []float64) {
 			a.envelope = 0.999*a.envelope + 0.001*mag
 		}
 
-		if a.envelope < a.minMagnitude {
-			// Dead air — freeze gain to avoid amplifying noise.
-			if a.hangCounter > 0 {
-				a.hangCounter--
-			}
-			samples[i] = s * a.gain
-			continue
+		if a.fastCounter > 0 {
+			a.fastCounter--
 		}
 
 		err := a.target / (a.envelope + 1e-6)
-		if err < a.gain {
+		switch {
+		case err < a.gain:
 			// Signal louder than target — attack down, arm hang.
 			a.gain = (1.0-a.attack)*a.gain + a.attack*err
 			a.hangCounter = a.hangSamples
-		} else {
-			// Signal quieter — only decay after hang expires.
-			if a.hangCounter > 0 {
-				a.hangCounter--
-			} else {
-				a.gain = (1.0-a.decay)*a.gain + a.decay*err
-			}
+		case a.fastCounter > 0:
+			// Start of a transmission — find this station's level now.
+			a.gain = (1.0-a.attack)*a.gain + a.attack*err
+		case a.hangCounter > 0:
+			// Mid-transmission dip between words — hold.
+			a.hangCounter--
+		default:
+			a.gain = (1.0-a.decay)*a.gain + a.decay*err
+		}
+		if a.gain > a.maxGain {
+			a.gain = a.maxGain
 		}
 
 		out := s * a.gain

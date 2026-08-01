@@ -514,10 +514,16 @@ func drain[T any](ch chan T) {
 }
 
 // gainStage is satisfied by any AGC variant — both pkg/dsp.AGC (FM) and
-// pkg/dsp.AudioAGC (AM hang-time) implement Process and Reset.
+// pkg/dsp.AudioAGC (AM hang-time) implement these.
+//
+// Reset discards state across a discontinuity (retune, dropped IQ). Restart
+// marks a new transmission, which is a different event: the stream is intact,
+// but the station on it has changed and its level may be nothing like the last
+// one's.
 type gainStage interface {
 	Process([]float64)
 	Reset()
+	Restart()
 }
 
 // qualityReport carries the client's most recent loss measurement (0-100).
@@ -640,6 +646,10 @@ type dspChain struct {
 	lastCarrierScan time.Time
 	pendingOffset   float64
 
+	// dcBlock removes the tuner's LO leakage from the raw IQ before anything
+	// reads it. See dsp.IQDCBlocker for why that matters to four stages at once.
+	dcBlock *dsp.IQDCBlocker
+
 	// Scratch, reused every block.
 	iq       []complex128 // CU8 → complex
 	hann     *dsp.HannWindow
@@ -685,6 +695,11 @@ func (c *dspChain) Reset() {
 		c.fineTune.SetOffset(0)
 		c.pendingOffset = 0
 		c.lastCarrierScan = time.Time{}
+	}
+	if c.dcBlock != nil {
+		// The offset belongs to the tuner at its current frequency, so a
+		// retune invalidates the estimate rather than merely disturbing it.
+		c.dcBlock.Reset()
 	}
 	if c.opusEnc != nil {
 		c.opusEnc.Reset()
@@ -753,6 +768,9 @@ func airbandSearchHz(freqHz uint64) float64 {
 //
 // AGC and Opus encoding stay in the pipeline rather than living here: both run
 // only while the gate is open, so the caller needs the gate decision first.
+//
+// The IQ is expected to have had the tuner's DC offset removed already; the
+// pipeline does that ahead of the spectrum FFT, which needs it too.
 //
 // Being callable without a pipeline, an SDR or a network is the point — it is
 // what lets the demodulation chain be measured end to end.
@@ -937,8 +955,8 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 	// FM: regular AGC — amplitude doesn't carry info, fast attack is fine.
 	var gain gainStage
 	if mode == protocol.ModeAM {
-		gain = dsp.NewAudioAGC(0.17, 0.1, 0.001, 500.0, float64(audioRate), 0.02)
-		log.Printf("[dsp] AM hang-time AudioAGC: hang=500ms minMag=0.02")
+		gain = dsp.NewAudioAGC(dsp.AMAGCTarget, 0.1, 0.001, 500.0, float64(audioRate), 0)
+		log.Printf("[dsp] AM hang-time AudioAGC: target=%.2f hang=500ms", dsp.AMAGCTarget)
 	} else {
 		gain = dsp.NewAGC(-12, 30, 20.0, 500.0, float64(audioRate))
 	}
@@ -994,6 +1012,7 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		carrierWindow: carrierWindow,
 		opusEnc:       opusEnc,
 		audioRate:     audioRate,
+		dcBlock:       dsp.NewIQDCBlocker(0),
 		hann:          dsp.NewHannWindow(cfg.FFTSize),
 		fftFrame:      make([]complex128, cfg.FFTSize),
 		fftBins:       make([]byte, cfg.FFTBins),
@@ -1252,6 +1271,12 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 			chain.iq = iq
 			state.recycleBuf(rawBuf)
 
+			// Strip the tuner's LO leakage before anything reads the block —
+			// the spectrum, the S-meter, the squelch and the carrier tracker
+			// are all misled by it, each in its own way. The estimate itself is
+			// only refined on blocks with the gate shut, further down.
+			chain.dcBlock.Process(iq)
+
 			// --- FFT waterfall (on raw wideband IQ) ---
 			// The FFT window is simply the tail of the current block: any
 			// contiguous fftSize samples are a valid snapshot, so there is no
@@ -1295,6 +1320,14 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 			signalPowerDb = float32(channelPowerDb)
 			squelchOpen = open
 
+			// Refine the DC estimate only on quiet blocks. A carrier tuned dead
+			// on frequency also sits at DC, so adapting through a transmission
+			// would subtract the signal itself. Leakage drifts over minutes and
+			// transmissions last seconds, so holding still costs nothing.
+			if !squelchOpen || chain.dcBlock.Priming() {
+				chain.dcBlock.Refine(iq)
+			}
+
 			// Send status datagram periodically.
 			// Payload: [float32 smeter][float32 squelch][uint8 mode][uint64 freqHz]
 			if time.Since(lastStatus) >= statusInterval {
@@ -1337,7 +1370,15 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 				}
 				continue
 			}
-			wasOpen = true
+			if !wasOpen {
+				wasOpen = true
+				// A new transmission, not a continuation. On the airband the
+				// previous one might have been an aircraft directly overhead and
+				// this one a distant ground station 20 dB down; carrying the old
+				// gain over leaves the quiet one barely audible until hang and
+				// decay have run their course.
+				chain.gain.Restart()
+			}
 
 			// AGC: smooth gain control (regular AGC for FM, hang-time for AM).
 			chain.gain.Process(audioSamples)
