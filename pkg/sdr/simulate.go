@@ -22,11 +22,27 @@ type SimulatedDevice struct {
 	signals []simSignal
 }
 
+// modulation of a simulated signal.
+type modulation int
+
+const (
+	modFM modulation = iota
+	modAM
+)
+
 type simSignal struct {
-	freqHz    uint64  // absolute frequency in Hz
-	amplitude float64 // 0-1
-	freqDev   float64 // FM deviation in Hz
-	audioHz   float64 // modulating audio tone frequency
+	freqHz    uint64     // nominal channel frequency in Hz
+	amplitude float64    // 0-1
+	mod       modulation // FM or DSB-AM
+	freqDev   float64    // FM deviation in Hz (FM only)
+	audioHz   float64    // modulating audio tone frequency
+	// carrierOffsetHz shifts the carrier away from the nominal channel, which
+	// is what aviation ground stations do in offset-carrier ("Climax")
+	// operation: several transmitters cover one sector on staggered carriers,
+	// while aircraft transmit on the nominal frequency.
+	carrierOffsetHz float64
+	// amDepth is the AM modulation index (0-1).
+	amDepth float64
 }
 
 // OpenSimulated creates a fake SDR device with signals at fixed absolute frequencies.
@@ -38,16 +54,32 @@ func OpenSimulated(sampleRate int, centerFreq uint64) *SimulatedDevice {
 		cancelled:  make(chan struct{}),
 		signals: []simSignal{
 			// VHF signals
-			{freqHz: 144_800_000, amplitude: 0.4, freqDev: 3000, audioHz: 800},
-			{freqHz: 144_900_000, amplitude: 0.25, freqDev: 5000, audioHz: 1200},
-			{freqHz: 145_500_000, amplitude: 0.15, freqDev: 2000, audioHz: 600},
-			{freqHz: 145_000_000, amplitude: 0.3, freqDev: 4000, audioHz: 1000},
+			{freqHz: 144_800_000, amplitude: 0.4, mod: modFM, freqDev: 3000, audioHz: 800},
+			{freqHz: 144_900_000, amplitude: 0.25, mod: modFM, freqDev: 5000, audioHz: 1200},
+			{freqHz: 145_500_000, amplitude: 0.15, mod: modFM, freqDev: 2000, audioHz: 600},
+			{freqHz: 145_000_000, amplitude: 0.3, mod: modFM, freqDev: 4000, audioHz: 1000},
 			// UHF signals
-			{freqHz: 433_500_000, amplitude: 0.35, freqDev: 3000, audioHz: 700},
-			{freqHz: 446_006_250, amplitude: 0.2, freqDev: 2500, audioHz: 1500},
-			// Airband (AM)
-			{freqHz: 121_500_000, amplitude: 0.3, freqDev: 3000, audioHz: 400},
-			{freqHz: 123_450_000, amplitude: 0.2, freqDev: 2000, audioHz: 900},
+			{freqHz: 433_500_000, amplitude: 0.35, mod: modFM, freqDev: 3000, audioHz: 700},
+			{freqHz: 446_006_250, amplitude: 0.2, mod: modFM, freqDev: 2500, audioHz: 1500},
+
+			// Airband, genuinely AM — these used to be FM like everything else,
+			// which meant the AM demod path and anything reading an AM carrier
+			// could never be exercised without real hardware.
+			//
+			// 121.500 is an on-channel aircraft-style transmission.
+			{freqHz: 121_500_000, amplitude: 0.3, mod: modAM, audioHz: 400, amDepth: 0.7},
+			{freqHz: 123_450_000, amplitude: 0.2, mod: modAM, audioHz: 900, amDepth: 0.6},
+			// An 8.33 kHz neighbour of 121.500, carrying a distinct tone. In
+			// Europe channels really are this close, and a channel filter wide
+			// enough to catch offset carriers is also wide enough to let the
+			// neighbour through — which is what makes narrowing worthwhile.
+			{freqHz: 121_508_333, amplitude: 0.22, mod: modAM, audioHz: 1150, amDepth: 0.7},
+			// 125.500 models a 25 kHz channel served by offset-carrier ground
+			// transmitters: two carriers either side of nominal, no on-channel
+			// one, exactly the case where a narrow filter fixed on centre hears
+			// nothing at all.
+			{freqHz: 125_500_000, amplitude: 0.25, mod: modAM, audioHz: 600, amDepth: 0.7, carrierOffsetHz: -7500},
+			{freqHz: 125_500_000, amplitude: 0.18, mod: modAM, audioHz: 600, amDepth: 0.7, carrierOffsetHz: +7500},
 		},
 	}
 }
@@ -110,27 +142,43 @@ func (d *SimulatedDevice) ReadAsync(cb func(buf []byte), bufCount, bufSize int) 
 
 				for s := range signals {
 					sig := &signals[s]
-					// Compute offset from current center frequency
-					offset := float64(sig.freqHz) - centerFreq
+					// Offset from the current centre, including any deliberate
+					// carrier offset for this transmitter.
+					offset := float64(sig.freqHz) + sig.carrierOffsetHz - centerFreq
 
 					// Only generate signal if within bandwidth
 					if offset > halfBW || offset < -halfBW {
 						continue
 					}
 
-					// FM-modulated tone
 					modPhase[s] += 2 * math.Pi * sig.audioHz / sr
 					if modPhase[s] > 2*math.Pi {
 						modPhase[s] -= 2 * math.Pi
 					}
-					instFreq := offset + sig.freqDev*math.Sin(modPhase[s])
-					phase[s] += 2 * math.Pi * instFreq / sr
-					if phase[s] > 2*math.Pi {
-						phase[s] -= 2 * math.Pi
-					}
 
-					re += sig.amplitude * math.Cos(phase[s])
-					im += sig.amplitude * math.Sin(phase[s])
+					switch sig.mod {
+					case modAM:
+						// DSB-AM: constant-frequency carrier, amplitude varying
+						// with the audio. The carrier stays put while the
+						// envelope moves, which is the property AM squelch and
+						// carrier tracking both rely on.
+						phase[s] += 2 * math.Pi * offset / sr
+						if phase[s] > 2*math.Pi {
+							phase[s] -= 2 * math.Pi
+						}
+						env := sig.amplitude * (1 + sig.amDepth*math.Sin(modPhase[s]))
+						re += env * math.Cos(phase[s])
+						im += env * math.Sin(phase[s])
+					default:
+						// FM-modulated tone
+						instFreq := offset + sig.freqDev*math.Sin(modPhase[s])
+						phase[s] += 2 * math.Pi * instFreq / sr
+						if phase[s] > 2*math.Pi {
+							phase[s] -= 2 * math.Pi
+						}
+						re += sig.amplitude * math.Cos(phase[s])
+						im += sig.amplitude * math.Sin(phase[s])
+					}
 				}
 
 				// Add noise

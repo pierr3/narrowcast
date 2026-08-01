@@ -48,6 +48,16 @@ type Config struct {
 	// running an old client build against an updated Pi.
 	AudioSeq bool
 
+	// AMCarrierTrack follows the transmitting carrier within the AM channel and
+	// filters narrowly around it. Aviation ground stations often sit several kHz
+	// off the nominal channel (offset-carrier operation), so a narrow filter
+	// fixed on centre would cut them off — tracking gives a narrow filter, and
+	// therefore much less hiss, without losing them.
+	AMCarrierTrack bool
+	// AMHalfBandwidthHz is the narrow filter's half-bandwidth once centred.
+	// Aviation AM voice occupies roughly ±3.5 kHz.
+	AMHalfBandwidthHz float64
+
 	// Diagnostics
 	PProfAddr string // e.g. "localhost:6060"; empty disables
 }
@@ -87,6 +97,8 @@ func DefaultConfig() *Config {
 		FFTRate:             10,
 		OpusBitrate:         32000,
 		AudioSeq:            true,
+		AMCarrierTrack:      true,
+		AMHalfBandwidthHz:   3500,
 	}
 }
 
@@ -107,6 +119,10 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.Float64Var(&c.SquelchHangMs, "squelch-hang", c.SquelchHangMs,
 		"ms to hold the squelch open after the signal drops")
 	fs.IntVar(&c.OpusBitrate, "opus-bitrate", c.OpusBitrate, "Opus encoder bitrate (bps)")
+	fs.BoolVar(&c.AMCarrierTrack, "am-carrier-track", c.AMCarrierTrack,
+		"follow the transmitting carrier within an AM channel and filter narrowly around it")
+	fs.Float64Var(&c.AMHalfBandwidthHz, "am-bandwidth", c.AMHalfBandwidthHz,
+		"half-bandwidth in Hz of the narrow AM filter once centred on the carrier")
 	fs.BoolVar(&c.AudioSeq, "audio-seq", c.AudioSeq, "Send sequence-numbered audio datagrams (needed for client-side Opus FEC)")
 	fs.StringVar(&c.PProfAddr, "pprof", c.PProfAddr, "Serve net/http/pprof on this address (e.g. localhost:6060); empty disables")
 }

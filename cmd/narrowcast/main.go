@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof on http.DefaultServeMux
 	"os/signal"
@@ -628,6 +629,17 @@ type dspChain struct {
 	opusEnc     *audio.OpusEncoder
 	audioRate   int
 
+	// Carrier tracking (AM only; nil otherwise). The wide channel filter
+	// captures offset-carrier ground stations, then fineTune shifts whichever
+	// carrier is actually transmitting to DC and filters narrowly around it.
+	fineTune        *dsp.FineTuner
+	channelRate     float64
+	carrierSearchHz float64
+	carrierFFT      []complex128
+	carrierWindow   *dsp.HannWindow
+	lastCarrierScan time.Time
+	pendingOffset   float64
+
 	// Scratch, reused every block.
 	iq       []complex128 // CU8 → complex
 	hann     *dsp.HannWindow
@@ -667,9 +679,95 @@ func (c *dspChain) Reset() {
 	if c.squelch != nil {
 		c.squelch.Reset()
 	}
+	if c.fineTune != nil {
+		c.fineTune.Reset()
+		// A retune means the old carrier offset describes a different channel.
+		c.fineTune.SetOffset(0)
+		c.pendingOffset = 0
+		c.lastCarrierScan = time.Time{}
+	}
 	if c.opusEnc != nil {
 		c.opusEnc.Reset()
 	}
+}
+
+// Carrier tracking tuning constants.
+const (
+	// carrierFFTSize is the scan FFT length, run on the channel stream. At the
+	// 48 kHz AM channel rate that's ~94 Hz per bin — far finer than needed,
+	// since AM detection is non-coherent, and cheap at a few scans per second.
+	carrierFFTSize = 512
+	// amFilterTaps sets the narrow AM filter's sharpness. At 48 kHz a 65-tap
+	// filter leaves a ~4 kHz transition, which puts an 8.33 kHz neighbour only
+	// partly in the stopband; 161 taps tightens that to a few hundred Hz and is
+	// still trivial at the channel rate.
+	amFilterTaps = 161
+
+	// How often to look for the carrier. Ground stations don't move, so this
+	// only has to catch a *different* station keying up.
+	carrierScanInterval = 200 * time.Millisecond
+	// Two consecutive scans must agree within this to be believed, which stops
+	// a noise peak from dragging the tuning around.
+	carrierAgreeHz = 600
+	// Don't bother retuning for less than this; AM detection is non-coherent so
+	// a few hundred Hz of residual offset is inaudible.
+	carrierMoveHz = 400
+)
+
+// airbandSearchHz says how far either side of centre to look for a carrier,
+// derived from the channel plan the tuned frequency belongs to.
+//
+// The window has to come from the plan, not be a constant. On a 25 kHz channel
+// the nearest other channel is 25 kHz away and offset-carrier transmitters sit
+// up to ±7.5 kHz out, so a wide search is both safe and necessary. On an 8.33
+// channel the neighbours are only 8.33 kHz away — search that wide and the
+// tuner would happily lock onto the next channel's traffic.
+//
+// Carriers on the 8.33 grid are at multiples of 25000/3 Hz, so they don't divide
+// 25000 exactly; that's what distinguishes the two plans from the frequency
+// alone. Returns 0 to disable tracking outside the airband.
+func airbandSearchHz(freqHz uint64) float64 {
+	const (
+		airbandLow  = 118_000_000
+		airbandHigh = 137_000_000
+	)
+	if freqHz < airbandLow || freqHz > airbandHigh {
+		return 0
+	}
+	if freqHz%25_000 == 0 {
+		return 10_000 // 25 kHz channel: covers ±7.5 kHz offset carriers
+	}
+	return 3_500 // 8.33 kHz channel: stay well inside the neighbours
+}
+
+// trackCarrier looks for the transmitting carrier and points the fine tuner at
+// it. Runs on the wide channel stream — deliberately, since the narrow filter
+// downstream would reject an offset carrier and the tuner would never find it.
+func (c *dspChain) trackCarrier(channel []complex128, now time.Time) {
+	if c.fineTune == nil || c.carrierSearchHz <= 0 {
+		return
+	}
+	if len(channel) < len(c.carrierFFT) {
+		return
+	}
+	if now.Sub(c.lastCarrierScan) < carrierScanInterval {
+		return
+	}
+	c.lastCarrierScan = now
+
+	copy(c.carrierFFT, channel[len(channel)-len(c.carrierFFT):])
+	c.carrierWindow.Apply(c.carrierFFT)
+	dsp.FFT(c.carrierFFT)
+	offset := dsp.FindCarrierOffset(c.carrierFFT, c.channelRate, c.carrierSearchHz)
+
+	// Believe it only once two scans agree, then move only if it's worth it.
+	if math.Abs(offset-c.pendingOffset) <= carrierAgreeHz {
+		if math.Abs(offset-c.fineTune.OffsetHz()) > carrierMoveHz {
+			log.Printf("[dsp] carrier at %+.0f Hz from centre — retuning fine filter", offset)
+			c.fineTune.SetOffset(offset)
+		}
+	}
+	c.pendingOffset = offset
 }
 
 func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int) (*dspChain, error) {
@@ -786,6 +884,21 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 	squelch := dsp.NewSquelch(
 		float64(cfg.SquelchDBm), cfg.SquelchHysteresisDb, cfg.SquelchHangMs, decimatedRate)
 
+	// AM carrier tracking. The wide channel filter above stays wide so
+	// offset-carrier ground stations are captured at all; this stage then shifts
+	// whichever carrier is transmitting to DC and filters narrowly around it,
+	// which is where the hiss reduction comes from. See dsp.FineTuner.
+	var fineTune *dsp.FineTuner
+	var carrierFFT []complex128
+	var carrierWindow *dsp.HannWindow
+	if mode == protocol.ModeAM && cfg.AMCarrierTrack {
+		fineTune = dsp.NewFineTuner(cfg.AMHalfBandwidthHz, decimatedRate, amFilterTaps)
+		carrierFFT = make([]complex128, carrierFFTSize)
+		carrierWindow = dsp.NewHannWindow(carrierFFTSize)
+		log.Printf("[dsp] AM carrier tracking on, narrow filter ±%.0f Hz, scan FFT %d bins (%.0f Hz each)",
+			cfg.AMHalfBandwidthHz, carrierFFTSize, decimatedRate/carrierFFTSize)
+	}
+
 	return &dspChain{
 		xlat:        xlat,
 		fmDemod:     fmDemod,
@@ -798,11 +911,17 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		limiter:     limiter,
 		gain:        gain,
 		squelch:     squelch,
-		opusEnc:     opusEnc,
-		audioRate:   audioRate,
-		hann:        dsp.NewHannWindow(cfg.FFTSize),
-		fftFrame:    make([]complex128, cfg.FFTSize),
-		fftBins:     make([]byte, cfg.FFTBins),
+		fineTune:    fineTune,
+		channelRate: decimatedRate,
+		// The search window depends on the tuned frequency, so it's refreshed
+		// per block in the pipeline rather than fixed here.
+		carrierFFT:    carrierFFT,
+		carrierWindow: carrierWindow,
+		opusEnc:       opusEnc,
+		audioRate:     audioRate,
+		hann:          dsp.NewHannWindow(cfg.FFTSize),
+		fftFrame:      make([]complex128, cfg.FFTSize),
+		fftBins:       make([]byte, cfg.FFTBins),
 	}, nil
 }
 
@@ -1019,6 +1138,19 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 			state.mu.RUnlock()
 			chain.squelch.SetThreshold(float64(squelchThreshold))
 			squelchOpen = chain.squelch.Update(channelPowerDb, len(channelIQ))
+
+			// Carrier tracking + narrow filtering (AM only). Tracking reads the
+			// wide stream above; only the audio path gets narrowed.
+			if chain.fineTune != nil {
+				state.mu.RLock()
+				tuned := state.freqHz
+				state.mu.RUnlock()
+				chain.carrierSearchHz = airbandSearchHz(tuned)
+				if squelchOpen {
+					chain.trackCarrier(channelIQ, time.Now())
+				}
+				channelIQ = chain.fineTune.Process(channelIQ)
+			}
 
 			audioSamples := chain.demodFn(channelIQ)
 

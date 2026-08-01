@@ -179,6 +179,8 @@ narrowcast [flags]
   --fftrate       FFT frames/sec (default: 10)
   --squelch-hysteresis  dB below the threshold before the gate closes (default: 3)
   --squelch-hang        ms to hold the gate open after signal drops (default: 500)
+  --am-carrier-track    Follow the carrier within an AM channel (default: true)
+  --am-bandwidth        Narrow AM filter half-bandwidth in Hz (default: 3500)
   --opus-bitrate  Opus bitrate in bps (default: 32000)
   --audio-seq     Sequence-numbered audio datagrams (default: true)
   --pprof         Serve net/http/pprof on this address, e.g. localhost:6060
