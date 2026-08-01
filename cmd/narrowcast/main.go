@@ -745,6 +745,71 @@ func airbandSearchHz(freqHz uint64) float64 {
 	return 3_500 // 8.33 kHz channel: stay well inside the neighbours
 }
 
+// demodBlock runs one block of raw IQ through the chain: channel filter,
+// squelch decision, AM carrier tracking, demodulation and audio cleanup. It
+// returns the block's audio — owned by the chain and valid until the next call
+// — along with the channel power the squelch and S-meter both read, and the
+// gate decision. Audio is nil when the block produced none.
+//
+// AGC and Opus encoding stay in the pipeline rather than living here: both run
+// only while the gate is open, so the caller needs the gate decision first.
+//
+// Being callable without a pipeline, an SDR or a network is the point — it is
+// what lets the demodulation chain be measured end to end.
+func (c *dspChain) demodBlock(iq []complex128, squelchDb float64, tunedHz uint64, now time.Time) ([]float64, float64, bool) {
+	channelIQ := c.xlat.Process(iq)
+	if len(channelIQ) == 0 {
+		return nil, 0, false
+	}
+
+	// Squelch and S-meter both read channel power, measured here on the
+	// filtered RF channel before demodulation.
+	//
+	// This used to be the RMS of the demodulated *audio*, which is why the
+	// threshold felt impossible to set: speech dips between syllables, so the
+	// level fell below the line mid-sentence and chopped transmissions apart. An
+	// AM carrier is steady for the whole transmission and FM is
+	// constant-envelope, so channel power holds still while someone talks. The
+	// meter reports the same quantity the gate uses, so aiming the slider at
+	// what you see now works.
+	channelPowerDb := dsp.ChannelPowerDb(channelIQ)
+	c.squelch.SetThreshold(squelchDb)
+	open := c.squelch.Update(channelPowerDb, len(channelIQ))
+
+	// Carrier tracking + narrow filtering (AM only). Tracking reads the wide
+	// stream above; only the audio path gets narrowed.
+	if c.fineTune != nil {
+		c.carrierSearchHz = airbandSearchHz(tunedHz)
+		if open {
+			c.trackCarrier(channelIQ, now)
+		}
+		channelIQ = c.fineTune.Process(channelIQ)
+	}
+
+	audio := c.demodFn(channelIQ)
+
+	// Soft limit to compress ADC-saturated signals (FM only)
+	if c.limiter != nil {
+		c.limiter.Process(audio)
+	}
+	// Anti-aliased audio decimation to target rate
+	if c.audioDecimF != nil {
+		audio = c.audioDecimF.Process(audio)
+	}
+	// De-emphasis for FM modes
+	if c.deemph != nil {
+		c.deemph.Process(audio)
+	}
+	// AM voice cleanup: bandpass 400-3000 Hz
+	if c.voiceHPF != nil {
+		c.voiceHPF.Process(audio)
+	}
+	if c.voiceLPF != nil {
+		audio = c.voiceLPF.Process(audio)
+	}
+	return audio, channelPowerDb, open
+}
+
 // trackCarrier looks for the transmitting carrier and points the fine tuner at
 // it. Runs on the wide channel stream — deliberately, since the narrow filter
 // downstream would reject an offset carrier and the tuner would never find it.
@@ -1217,68 +1282,18 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 					len(iq), fftSize)
 			}
 
-			// --- Channel filter + demodulate ---
-			channelIQ := chain.xlat.Process(iq)
-			if len(channelIQ) == 0 {
+			state.mu.RLock()
+			squelchThreshold := float64(state.squelchDb)
+			tunedHz := state.freqHz
+			state.mu.RUnlock()
+
+			audioSamples, channelPowerDb, open := chain.demodBlock(
+				iq, squelchThreshold, tunedHz, time.Now())
+			if audioSamples == nil {
 				continue
 			}
-
-			// Squelch and S-meter both read channel power, measured here on the
-			// filtered RF channel before demodulation.
-			//
-			// This used to be the RMS of the demodulated *audio*, which is why
-			// the threshold felt impossible to set: speech dips between
-			// syllables, so the level fell below the line mid-sentence and
-			// chopped transmissions apart. An AM carrier is steady for the whole
-			// transmission and FM is constant-envelope, so channel power holds
-			// still while someone talks. The meter reports the same quantity the
-			// gate uses, so aiming the slider at what you see now works.
-			channelPowerDb := dsp.ChannelPowerDb(channelIQ)
 			signalPowerDb = float32(channelPowerDb)
-
-			state.mu.RLock()
-			squelchThreshold := state.squelchDb
-			state.mu.RUnlock()
-			chain.squelch.SetThreshold(float64(squelchThreshold))
-			squelchOpen = chain.squelch.Update(channelPowerDb, len(channelIQ))
-
-			// Carrier tracking + narrow filtering (AM only). Tracking reads the
-			// wide stream above; only the audio path gets narrowed.
-			if chain.fineTune != nil {
-				state.mu.RLock()
-				tuned := state.freqHz
-				state.mu.RUnlock()
-				chain.carrierSearchHz = airbandSearchHz(tuned)
-				if squelchOpen {
-					chain.trackCarrier(channelIQ, time.Now())
-				}
-				channelIQ = chain.fineTune.Process(channelIQ)
-			}
-
-			audioSamples := chain.demodFn(channelIQ)
-
-			// Soft limit to compress ADC-saturated signals (FM only)
-			if chain.limiter != nil {
-				chain.limiter.Process(audioSamples)
-			}
-
-			// Anti-aliased audio decimation to target rate
-			if chain.audioDecimF != nil {
-				audioSamples = chain.audioDecimF.Process(audioSamples)
-			}
-
-			// De-emphasis for FM modes
-			if chain.deemph != nil {
-				chain.deemph.Process(audioSamples)
-			}
-
-			// AM voice cleanup: bandpass 400-3000 Hz
-			if chain.voiceHPF != nil {
-				chain.voiceHPF.Process(audioSamples)
-			}
-			if chain.voiceLPF != nil {
-				audioSamples = chain.voiceLPF.Process(audioSamples)
-			}
+			squelchOpen = open
 
 			// Send status datagram periodically.
 			// Payload: [float32 smeter][float32 squelch][uint8 mode][uint64 freqHz]
