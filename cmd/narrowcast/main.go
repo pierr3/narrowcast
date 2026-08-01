@@ -878,7 +878,7 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		gain = dsp.NewAGC(-12, 30, 20.0, 500.0, float64(audioRate))
 	}
 
-	opusEnc, err := audio.NewOpusEncoder(audioRate, opusBitrate)
+	opusEnc, err := audio.NewOpusEncoder(audioRate, opusBitrate, cfg.OpusComplexity)
 	if err != nil {
 		return nil, err
 	}
@@ -933,6 +933,83 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		fftFrame:      make([]complex128, cfg.FFTSize),
 		fftBins:       make([]byte, cfg.FFTBins),
 	}, nil
+}
+
+// pipelineHealthInterval is how often the pipeline reports its own load.
+const pipelineHealthInterval = 60 * time.Second
+
+// pipelineHealth measures what fraction of the wall clock the pipeline spends
+// working, which is the number that decides whether audio is late.
+//
+// It exists because the obvious measurements both lie. Total CPU on a four-core
+// Pi reads ~25 % while this goroutine — a single thread doing all the DSP and
+// the Opus encode — is completely saturated, and the SoC temperature says
+// nothing about whether *this* thread made its deadline. Meanwhile "busy" is
+// bimodal: only the Opus encoder runs while the squelch is open, so a channel
+// that idles at 40 % can be over budget for the duration of every transmission,
+// which is exactly when anyone is listening.
+//
+// Over budget does not mean dropped audio straight away — iqChan absorbs 8
+// blocks, and because the pipeline is normally much faster than real time it
+// drains that backlog quickly. What it does mean is that the backlog is standing
+// latency for as long as the overload lasts, and once the queue is full the SDR
+// callback starts dropping, which forces a DSP reset. Both are audible: the
+// first as lag, the second as a break in the audio.
+type pipelineHealth struct {
+	// blockBudget is how much audio one IQ block represents, i.e. how long the
+	// pipeline may take on it and still keep up.
+	blockBudget time.Duration
+
+	windowStart time.Time
+	blocks      int
+	busy        time.Duration
+	worst       time.Duration
+}
+
+func newPipelineHealth(sampleRate int) *pipelineHealth {
+	samples := iqBufBytes(sampleRate) / 2
+	return &pipelineHealth{
+		blockBudget: time.Duration(float64(samples) / float64(sampleRate) * float64(time.Second)),
+		windowStart: time.Now(),
+	}
+}
+
+func (h *pipelineHealth) observe(d time.Duration) {
+	h.blocks++
+	h.busy += d
+	if d > h.worst {
+		h.worst = d
+	}
+}
+
+// report logs one line per interval and starts a new window. queued is the
+// current iqChan depth — standing latency, in blocks.
+func (h *pipelineHealth) report(now time.Time, queued, queueCap int, drops uint64) {
+	elapsed := now.Sub(h.windowStart)
+	if elapsed < pipelineHealthInterval || h.blocks == 0 {
+		return
+	}
+
+	busyPct := float64(h.busy) / float64(elapsed) * 100
+	mean := h.busy / time.Duration(h.blocks)
+	// Anything past ~70 % of one core has no room left for the transmission
+	// that hasn't started yet; a single block over budget already queued.
+	level := "health"
+	if busyPct > 70 || h.worst > h.blockBudget {
+		level = "HEALTH WARNING"
+	}
+	log.Printf("[pipeline] %s: %.0f%% of one core, %d blocks, mean %.2f ms, worst %.2f ms "+
+		"(budget %.1f ms), iq queue %d/%d, drops %d",
+		level, busyPct, h.blocks,
+		float64(mean)/float64(time.Millisecond),
+		float64(h.worst)/float64(time.Millisecond),
+		float64(h.blockBudget)/float64(time.Millisecond),
+		queued, queueCap, drops)
+
+	h.windowStart = now
+	h.blocks = 0
+	h.busy = 0
+	h.worst = 0
 }
 
 // runPipeline reads IQ data, demodulates, encodes, and broadcasts datagrams to
@@ -1005,7 +1082,22 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 
 	fftTooSmallLogged := false
 
+	health := newPipelineHealth(cfg.SampleRate)
+	// blockStart is set when a block is dequeued and settled at the top of the
+	// next iteration. Timing it there rather than at the end of the case body is
+	// what makes the early `continue` paths count too — a drop reset, an empty
+	// filter output and a closed squelch all exit that way, and they are the
+	// cheap paths, so leaving them out would flatter the average badly.
+	var blockStart time.Time
+
 	for {
+		if !blockStart.IsZero() {
+			now := time.Now()
+			health.observe(now.Sub(blockStart))
+			blockStart = time.Time{}
+			health.report(now, len(state.iqChan), cap(state.iqChan), state.dropCount.Load())
+		}
+
 		select {
 		case <-state.ctx.Done():
 			return
@@ -1076,6 +1168,7 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 			if !ok {
 				return
 			}
+			blockStart = time.Now()
 
 			// If the SDR callback dropped any buffers since the last block, the
 			// stream has a gap. Continuing with stale FIR/IIR history produces

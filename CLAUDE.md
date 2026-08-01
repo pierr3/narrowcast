@@ -27,6 +27,10 @@ Tests cover the pure logic where a silent regression would be expensive: `pkg/ds
 
 `--pprof localhost:6060` exposes `net/http/pprof`. Use it before optimizing anything on the Pi; the thermal budget is the real constraint and guesses about where the cycles go have been wrong before.
 
+**The pipeline reports its own load once a minute** (`[pipeline] health: … % of one core, mean/worst ms against the 20 ms block budget, iq queue, drops`), and that line is the first thing to read when someone says the audio is laggy. It exists because the two obvious measurements both mislead: total CPU on a four-core Pi reads ~25 % while the single pipeline goroutine is saturated, and SoC temperature says nothing about whether that goroutine made its deadline. The load is also bimodal — the Opus encoder only runs while the squelch is open — so a channel that idles comfortably can be over budget for the whole of every transmission. `HEALTH WARNING` in place of `health` means past 70 % of a core or a single block over budget. If the line reads a few percent, the lag is not on the Pi, and the next place to look is the client's own latency readout.
+
+**Opus encode is the most expensive stage in the pipeline, not the DSP.** At complexity 9 (libopus's own choice for this configuration) one 20 ms frame of 16 kHz mono measured 106 µs against 71 µs for the entire wideband channel filter; complexity 5 measured 51 µs for output that is indistinguishable at voice bitrates, because the extra search depth pays off on wideband music at high bitrates and finds almost nothing when the bitrate is the binding constraint. Hence `--opus-complexity` defaulting to 5. Anyone hunting Pi cycles should look here before micro-optimising a filter.
+
 ## Three-process topology
 
 ```

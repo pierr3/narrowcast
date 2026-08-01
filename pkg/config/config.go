@@ -41,6 +41,19 @@ type Config struct {
 
 	// Audio
 	OpusBitrate int
+	// OpusComplexity is the encoder's analysis effort, 0-10.
+	//
+	// This is the single most expensive stage in the pipeline and the only one
+	// that switches on when someone talks, so it sets how much headroom a
+	// transmission eats. Measured on one 20 ms frame of 16 kHz mono voice:
+	// complexity 9 (libopus's default here) costs 119 µs, complexity 5 costs
+	// 55 µs. That 64 µs is comparable to the entire wideband channel filter.
+	//
+	// The effort buys rate-distortion search depth, which pays off on wideband
+	// music at high bitrates — not on 16 kHz voice at 16-32 kbps, where the
+	// bitrate is the binding constraint and the extra searching finds almost
+	// nothing. 5 is what realtime voice stacks generally settle on.
+	OpusComplexity int
 	// AudioSeq emits DatagramAudioSeq (sequence-numbered) instead of
 	// DatagramAudio, which is what lets clients redeem the Opus in-band FEC the
 	// encoder is already paying for. Clients predating sequence support ignore
@@ -96,6 +109,7 @@ func DefaultConfig() *Config {
 		FFTBins:             256,
 		FFTRate:             10,
 		OpusBitrate:         32000,
+		OpusComplexity:      5,
 		AudioSeq:            true,
 		AMCarrierTrack:      true,
 		AMHalfBandwidthHz:   3500,
@@ -119,6 +133,8 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.Float64Var(&c.SquelchHangMs, "squelch-hang", c.SquelchHangMs,
 		"ms to hold the squelch open after the signal drops")
 	fs.IntVar(&c.OpusBitrate, "opus-bitrate", c.OpusBitrate, "Opus encoder bitrate (bps)")
+	fs.IntVar(&c.OpusComplexity, "opus-complexity", c.OpusComplexity,
+		"Opus encoder complexity 0-10; the pipeline's most expensive stage, and 5 is inaudible from 10 at voice bitrates")
 	fs.BoolVar(&c.AMCarrierTrack, "am-carrier-track", c.AMCarrierTrack,
 		"follow the transmitting carrier within an AM channel and filter narrowly around it")
 	fs.Float64Var(&c.AMHalfBandwidthHz, "am-bandwidth", c.AMHalfBandwidthHz,
@@ -161,6 +177,9 @@ func (c *Config) Validate() error {
 	}
 	if c.OpusBitrate < 6000 {
 		return fmt.Errorf("opus-bitrate %d is below the usable Opus minimum (6000)", c.OpusBitrate)
+	}
+	if c.OpusComplexity < 0 || c.OpusComplexity > 10 {
+		return fmt.Errorf("opus-complexity must be between 0 and 10, got %d", c.OpusComplexity)
 	}
 	return nil
 }

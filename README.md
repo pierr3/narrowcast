@@ -182,6 +182,7 @@ narrowcast [flags]
   --am-carrier-track    Follow the carrier within an AM channel (default: true)
   --am-bandwidth        Narrow AM filter half-bandwidth in Hz (default: 3500)
   --opus-bitrate  Opus bitrate in bps (default: 32000)
+  --opus-complexity     Opus encoder complexity 0-10 (default: 5)
   --audio-seq     Sequence-numbered audio datagrams (default: true)
   --pprof         Serve net/http/pprof on this address, e.g. localhost:6060
   --simulate      Use simulated SDR (no hardware needed)
