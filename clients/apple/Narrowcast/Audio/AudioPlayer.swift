@@ -59,6 +59,13 @@ public final class AudioPlayer: @unchecked Sendable {
         /// True while shedding down to targetFrames after exceeding maxFrames.
         var shedding: Bool = false
         var droppedPackets: Int = 0
+        /// Bumped on every start/stop transition, and checked by the deferred
+        /// pause below. A pause decided when the queue ran dry must not land
+        /// after a new transmission has already restarted playback: that leaves
+        /// the node paused while `playing` is true, so nothing ever calls play()
+        /// again and the backlog never drains — silent for the rest of the
+        /// session, with every subsequent packet shed as if it were late.
+        var generation: UInt64 = 0
     }
 
     public init(sampleRate: Int,
@@ -96,6 +103,9 @@ public final class AudioPlayer: @unchecked Sendable {
             state.playing = false
             state.queuedFrames = 0
             state.shedding = false
+            // Invalidate any pause still queued, so it can't fire against a
+            // player that has since been restarted.
+            state.generation &+= 1
         }
     }
 
@@ -146,6 +156,7 @@ public final class AudioPlayer: @unchecked Sendable {
                 state.prerolledPackets += 1
                 if state.prerolledPackets >= prerollPackets {
                     state.playing = true
+                    state.generation &+= 1
                     return .scheduleAndStart
                 }
             }
@@ -162,12 +173,20 @@ public final class AudioPlayer: @unchecked Sendable {
             self?.framesPlayed(frames)
         }
 
+        // Transport calls go through controlQueue so play and pause can never
+        // run concurrently from the enqueue path and a completion callback.
+        // Scheduling above already happened synchronously, so the buffer is
+        // queued before the engine starts — starting first can spin a tick on an
+        // empty player and mute briefly.
         if action == .scheduleAndStart {
-            do {
-                if !engine.isRunning { try engine.start() }
-                player.play()
-            } catch {
-                NSLog("[narrowcast] audio engine start: \(error)")
+            controlQueue.async { [weak self] in
+                guard let self else { return }
+                do {
+                    if !self.engine.isRunning { try self.engine.start() }
+                    self.player.play()
+                } catch {
+                    NSLog("[narrowcast] audio engine start: \(error)")
+                }
             }
         }
     }
@@ -175,18 +194,26 @@ public final class AudioPlayer: @unchecked Sendable {
     /// Called from the engine's completion callback once a buffer has actually
     /// been played out.
     private func framesPlayed(_ frames: Int) {
-        let ranDry = stateLock.withLock { state -> Bool in
+        let pauseGeneration = stateLock.withLock { state -> UInt64? in
             state.queuedFrames = max(0, state.queuedFrames - frames)
-            guard state.playing, state.queuedFrames == 0 else { return false }
+            guard state.playing, state.queuedFrames == 0 else { return nil }
             // Nothing left to play. Re-arm the preroll so the next transmission
             // rebuilds a cushion rather than running with zero slack, where any
             // jitter is an audible chop.
             state.playing = false
             state.prerolledPackets = 0
-            return true
+            state.generation &+= 1
+            return state.generation
         }
-        if ranDry {
-            controlQueue.async { [weak self] in self?.player.pause() }
+        guard let pauseGeneration else { return }
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            // Skip the pause if a transmission has restarted playback since this
+            // was decided — see State.generation.
+            let stillIdle = self.stateLock.withLock {
+                $0.generation == pauseGeneration && !$0.playing
+            }
+            if stillIdle { self.player.pause() }
         }
     }
 
