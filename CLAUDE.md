@@ -75,6 +75,7 @@ Three modes' worth of chain, but **one pipeline for the whole device**, not one 
 
 A few non-obvious invariants:
 
+- **Squelch gates on channel power, never on audio level.** `dsp.Squelch` reads the filtered RF channel before demodulation, because an AM carrier and an FM envelope are both steady for a whole transmission while *audio* level dips between syllables. Gating on audio (as this did originally) makes the threshold impossible to set: it chatters mid-sentence. The S-meter reports the same quantity, so the number on the meter is the number to aim the slider at — don't change one without the other. Hysteresis absorbs noise at the set point; hang time bridges speech gaps; a *threshold change* deliberately bypasses hysteresis so dragging the slider above a signal mutes it immediately.
 - **AM uses `AudioAGC` (hang-time), not `AGC`** — standard AGC ramps gain into the noise floor between pushes-to-talk and clips the start of the next transmission. Hang-time freezes gain during dead air. Don't change AM to regular AGC.
 - **AM skips the soft limiter** — amplitude IS the audio in AM, so tanh compression distorts the voice.
 - **`dspChain.Reset()` is called on two events**: hardware retune (drains stale IQ from `iqChan` + zeros every filter history), and SDR drop (the callback dropped buffers because the pipeline couldn't keep up). Continuing to filter across a discontinuity produces audible warbling. Any new stateful DSP stage must implement `Reset()`.

@@ -75,8 +75,8 @@ Periodic telemetry frame. Default rate 10 Hz. (It was 20 Hz; each frame costs th
 +------+----------------+----------------+----------+----------------+----------+
 ```
 
-- `smeter` is the post-channel-filter signal level in dBm. Range typically `-120..0`. Used for the S-meter UI.
-- `squelch` is the current threshold in dBm.
+- `smeter` is **channel power** — the mean power of the filtered RF channel, before demodulation, in dBFS (full-scale IQ = 0 dB). Range typically `-120..0`. Used for the S-meter UI.
+- `squelch` is the current threshold, on the same scale. The squelch gate reads the same measurement the meter reports, which is what makes the meter usable for aiming the threshold. (It used to be the RMS of the demodulated audio, which dipped between syllables and made the gate chatter mid-transmission.)
 - `mode` is the active `DemodMode` enum (`0=NFM`, `1=WFM`, `2=AM`).
 - `freq` is the current center frequency in Hz.
 - `cc` is **optional** — appended by the relay before fan-out as the connected-client count, clamped to 255. Standalone (no-relay) deployments emit this field as zero-length, i.e. the datagram is 21 bytes total instead of 22. Clients must tolerate either length.

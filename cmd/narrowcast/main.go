@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof on http.DefaultServeMux
 	"os/signal"
@@ -625,6 +624,7 @@ type dspChain struct {
 	voiceLPF    *dsp.RealFIRFilter // voice bandpass low-pass (AM only)
 	limiter     *dsp.SoftLimiter   // soft clipper for ADC saturation
 	gain        gainStage          // AGC (FM) or hang-time AudioAGC (AM)
+	squelch     *dsp.Squelch       // gates on channel power, not audio level
 	opusEnc     *audio.OpusEncoder
 	audioRate   int
 
@@ -663,6 +663,9 @@ func (c *dspChain) Reset() {
 	}
 	if c.gain != nil {
 		c.gain.Reset()
+	}
+	if c.squelch != nil {
+		c.squelch.Reset()
 	}
 	if c.opusEnc != nil {
 		c.opusEnc.Reset()
@@ -777,6 +780,12 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		return nil, err
 	}
 
+	// Squelch runs on the channel stream, so its hang time is measured at
+	// decimatedRate. See dsp.Squelch for why it gates on channel power rather
+	// than audio level.
+	squelch := dsp.NewSquelch(
+		float64(cfg.SquelchDBm), cfg.SquelchHysteresisDb, cfg.SquelchHangMs, decimatedRate)
+
 	return &dspChain{
 		xlat:        xlat,
 		fmDemod:     fmDemod,
@@ -788,6 +797,7 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		voiceLPF:    voiceLPF,
 		limiter:     limiter,
 		gain:        gain,
+		squelch:     squelch,
 		opusEnc:     opusEnc,
 		audioRate:   audioRate,
 		hann:        dsp.NewHannWindow(cfg.FFTSize),
@@ -858,10 +868,11 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 	const statusInterval = 100 * time.Millisecond
 	var signalPowerDb float32 = -120
 
-	// squelchOpen tracks the gate so the Opus encoder can be reset exactly
-	// once on close: without that, samples buffered before the gap get
-	// prepended to the next transmission as a click.
-	squelchOpen := true
+	// squelchOpen is this block's gate decision; wasOpen tracks the previous one
+	// so the Opus encoder is reset exactly once on close — without that, samples
+	// buffered before the gap get prepended to the next transmission as a click.
+	squelchOpen := false
+	wasOpen := false
 
 	fftTooSmallLogged := false
 
@@ -990,6 +1001,25 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 				continue
 			}
 
+			// Squelch and S-meter both read channel power, measured here on the
+			// filtered RF channel before demodulation.
+			//
+			// This used to be the RMS of the demodulated *audio*, which is why
+			// the threshold felt impossible to set: speech dips between
+			// syllables, so the level fell below the line mid-sentence and
+			// chopped transmissions apart. An AM carrier is steady for the whole
+			// transmission and FM is constant-envelope, so channel power holds
+			// still while someone talks. The meter reports the same quantity the
+			// gate uses, so aiming the slider at what you see now works.
+			channelPowerDb := dsp.ChannelPowerDb(channelIQ)
+			signalPowerDb = float32(channelPowerDb)
+
+			state.mu.RLock()
+			squelchThreshold := state.squelchDb
+			state.mu.RUnlock()
+			chain.squelch.SetThreshold(float64(squelchThreshold))
+			squelchOpen = chain.squelch.Update(channelPowerDb, len(channelIQ))
+
 			audioSamples := chain.demodFn(channelIQ)
 
 			// Soft limit to compress ADC-saturated signals (FM only)
@@ -1013,20 +1043,6 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 			}
 			if chain.voiceLPF != nil {
 				audioSamples = chain.voiceLPF.Process(audioSamples)
-			}
-
-			// Measure signal power for S-meter (before AGC)
-			if len(audioSamples) > 0 {
-				var sumSq float64
-				for _, s := range audioSamples {
-					sumSq += s * s
-				}
-				rms := math.Sqrt(sumSq / float64(len(audioSamples)))
-				if rms > 1e-10 {
-					signalPowerDb = float32(20 * math.Log10(rms))
-				} else {
-					signalPowerDb = -120
-				}
 			}
 
 			// Send status datagram periodically.
@@ -1060,20 +1076,18 @@ func runPipeline(state *serverState, stop <-chan struct{}) {
 				state.broadcast(mark)
 			}
 
-			// Squelch gate: skip audio when signal is below threshold.
-			state.mu.RLock()
-			squelchThreshold := state.squelchDb
-			state.mu.RUnlock()
-			if signalPowerDb < squelchThreshold {
-				if squelchOpen {
-					squelchOpen = false
+			// Squelch gate — decided above from channel power, with hysteresis
+			// and hang time (see dsp.Squelch).
+			if !squelchOpen {
+				if wasOpen {
+					wasOpen = false
 					// Drop the partial frame buffered in the encoder so it
 					// isn't prepended to the next transmission.
 					chain.opusEnc.Reset()
 				}
 				continue
 			}
-			squelchOpen = true
+			wasOpen = true
 
 			// AGC: smooth gain control (regular AGC for FM, hang-time for AM).
 			chain.gain.Process(audioSamples)

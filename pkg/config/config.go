@@ -26,6 +26,13 @@ type Config struct {
 	FrequencyHz uint64
 	DemodMode   protocol.DemodMode
 	SquelchDBm  float32
+	// SquelchHysteresisDb is how far below the open threshold the signal must
+	// fall before the gate closes. Without it a threshold set near a signal
+	// flutters open and shut on noise.
+	SquelchHysteresisDb float64
+	// SquelchHangMs keeps the gate open after the signal drops, bridging the
+	// pauses between words and the brief dip as a transmitter unkeys.
+	SquelchHangMs float64
 
 	// DSP
 	FFTSize int // FFT length (power of two); sets frequency resolution
@@ -65,11 +72,21 @@ func DefaultConfig() *Config {
 		FrequencyHz:   144_800_000,
 		DemodMode:     protocol.ModeNFM,
 		SquelchDBm:    -80,
-		FFTSize:       1024,
-		FFTBins:       256,
-		FFTRate:       10,
-		OpusBitrate:   32000,
-		AudioSeq:      true,
+		// Hysteresis stays small — it exists to stop noise flickering right at
+		// the set point, nothing more. Wider values (6 dB+) surprise the user:
+		// raising the squelch above a signal wouldn't mute it, because the
+		// close point sat 6 dB lower still.
+		//
+		// Riding out the dips between syllables is the hang timer's job, and
+		// 500 ms comfortably covers a pause in speech without leaving the
+		// channel audibly open after a transmission ends.
+		SquelchHysteresisDb: 3,
+		SquelchHangMs:       500,
+		FFTSize:             1024,
+		FFTBins:             256,
+		FFTRate:             10,
+		OpusBitrate:         32000,
+		AudioSeq:            true,
 	}
 }
 
@@ -85,6 +102,10 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.FFTSize, "fftsize", c.FFTSize, "FFT length (power of two)")
 	fs.IntVar(&c.FFTBins, "fftbins", c.FFTBins, "FFT bins transmitted per frame (max-pooled from fftsize)")
 	fs.IntVar(&c.FFTRate, "fftrate", c.FFTRate, "FFT frames per second")
+	fs.Float64Var(&c.SquelchHysteresisDb, "squelch-hysteresis", c.SquelchHysteresisDb,
+		"dB below the squelch threshold before the gate closes")
+	fs.Float64Var(&c.SquelchHangMs, "squelch-hang", c.SquelchHangMs,
+		"ms to hold the squelch open after the signal drops")
 	fs.IntVar(&c.OpusBitrate, "opus-bitrate", c.OpusBitrate, "Opus encoder bitrate (bps)")
 	fs.BoolVar(&c.AudioSeq, "audio-seq", c.AudioSeq, "Send sequence-numbered audio datagrams (needed for client-side Opus FEC)")
 	fs.StringVar(&c.PProfAddr, "pprof", c.PProfAddr, "Serve net/http/pprof on this address (e.g. localhost:6060); empty disables")
