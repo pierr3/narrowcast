@@ -32,7 +32,7 @@ const ftRate = 48000.0
 // where it sat. This is the offset-carrier ("Climax") case: the controller is
 // several kHz off the nominal channel.
 func TestFineTunerRecoversOffsetCarrier(t *testing.T) {
-	ft := NewFineTuner(4000, ftRate, 65)
+	ft := NewFineTuner(4000, ftRate, 65, 1)
 	in := tone(7500, ftRate, 4096, 1)
 
 	// Untuned, a ±4 kHz filter should reject a 7.5 kHz carrier hard.
@@ -55,7 +55,7 @@ func TestFineTunerRecoversOffsetCarrier(t *testing.T) {
 
 // The narrowing has to actually reject what's outside it, or there's no point.
 func TestFineTunerRejectsAdjacentEnergy(t *testing.T) {
-	ft := NewFineTuner(4000, ftRate, 65)
+	ft := NewFineTuner(4000, ftRate, 65, 1)
 	ft.SetOffset(0)
 
 	// In-band voice sideband stays.
@@ -78,7 +78,7 @@ func TestFineTunerRejectsAdjacentEnergy(t *testing.T) {
 }
 
 func TestFineTunerZeroOffsetIsTransparentToPhase(t *testing.T) {
-	ft := NewFineTuner(6000, ftRate, 33)
+	ft := NewFineTuner(6000, ftRate, 33, 1)
 	in := tone(1000, ftRate, 1024, 1)
 	ft.Process(in)
 	out := ft.Process(in)
@@ -93,7 +93,7 @@ func TestFineTunerZeroOffsetIsTransparentToPhase(t *testing.T) {
 }
 
 func TestFineTunerSetOffsetKeepsPhaseContinuous(t *testing.T) {
-	ft := NewFineTuner(4000, ftRate, 33)
+	ft := NewFineTuner(4000, ftRate, 33, 1)
 	in := tone(0, ftRate, 512, 1)
 	ft.Process(in)
 
@@ -106,6 +106,23 @@ func TestFineTunerSetOffsetKeepsPhaseContinuous(t *testing.T) {
 	jump := cmplx.Abs(after[0] - last)
 	if jump > 0.35 {
 		t.Errorf("amplitude jumped %.3f across a retune — audible click", jump)
+	}
+}
+
+// Decimation is folded into this stage in production, so it has to keep working
+// with a decimating filter.
+func TestFineTunerDecimatesWhileTuning(t *testing.T) {
+	ft := NewFineTuner(3500, ftRate, 65, 3)
+	ft.SetOffset(7500)
+	in := tone(7500, ftRate, 3072, 1)
+	ft.Process(in)
+	out := ft.Process(in)
+
+	if want := len(in) / 3; len(out) < want-2 || len(out) > want+2 {
+		t.Errorf("got %d output samples, want ≈%d", len(out), want)
+	}
+	if m := meanMag(out); m < 0.8 {
+		t.Errorf("tuned carrier attenuated to %.3f while decimating", m)
 	}
 }
 
@@ -152,8 +169,9 @@ func TestFindCarrierOffsetHandlesDegenerateInput(t *testing.T) {
 }
 
 func BenchmarkFineTuner(b *testing.B) {
-	// One 20 ms AM block at the channel rate.
-	ft := NewFineTuner(4000, ftRate, 65)
+	// One 20 ms AM block at the channel rate, decimating 3:1 to the audio rate
+	// exactly as the AM chain does.
+	ft := NewFineTuner(3500, ftRate, 65, 3)
 	ft.SetOffset(7500)
 	in := tone(7500, ftRate, int(ftRate*0.020), 1)
 

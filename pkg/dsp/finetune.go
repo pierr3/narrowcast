@@ -44,12 +44,20 @@ type FineTuner struct {
 }
 
 // NewFineTuner builds a fine tuner with a low-pass of the given half-bandwidth
-// (Hz from DC) operating at sampleRate.
-func NewFineTuner(halfBandwidthHz, sampleRate float64, numTaps int) *FineTuner {
+// (Hz from DC) operating at sampleRate, decimating its output by decim.
+//
+// Decimating here rather than downstream matters for cost. The narrow filter is
+// the most expensive thing in this stage — it runs over both components, so
+// tap count is paid twice — and its price is set by how many *outputs* it
+// computes. Since the passband is only a few kHz, there is no reason to produce
+// them at the full channel rate: folding the audio decimation in cuts the work
+// by that factor. Getting this wrong made this stage cost more than the
+// wideband channel filter it was supposed to be a rounding error beside.
+func NewFineTuner(halfBandwidthHz, sampleRate float64, numTaps, decim int) *FineTuner {
 	taps := NewLowPassFIR(halfBandwidthHz, sampleRate, numTaps)
 	return &FineTuner{
-		lpf:        NewRealFIRDecimator(taps, 1),
-		lpfIm:      NewRealFIRDecimator(taps, 1),
+		lpf:        NewRealFIRDecimator(taps, decim),
+		lpfIm:      NewRealFIRDecimator(taps, decim),
 		sampleRate: sampleRate,
 		phase:      complex(1, 0),
 		step:       complex(1, 0),

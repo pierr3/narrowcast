@@ -697,11 +697,16 @@ const (
 	// 48 kHz AM channel rate that's ~94 Hz per bin — far finer than needed,
 	// since AM detection is non-coherent, and cheap at a few scans per second.
 	carrierFFTSize = 512
-	// amFilterTaps sets the narrow AM filter's sharpness. At 48 kHz a 65-tap
-	// filter leaves a ~4 kHz transition, which puts an 8.33 kHz neighbour only
-	// partly in the stopband; 161 taps tightens that to a few hundred Hz and is
-	// still trivial at the channel rate.
-	amFilterTaps = 161
+	// amFilterTaps sets the narrow AM filter's transition width. Stopband depth
+	// comes from the window (~53 dB for Hamming) and does not improve with more
+	// taps, so this only has to be enough to put an 8.33 kHz neighbour past the
+	// transition: at 48 kHz, 65 taps gives ~2.4 kHz of transition, so the
+	// stopband starts around 6 kHz — comfortably below the neighbour at 8.3 kHz.
+	//
+	// It is paid twice (once per component) at every output, so this is the most
+	// expensive number in the AM chain; 161 taps measured *more* costly than the
+	// entire wideband channel filter.
+	amFilterTaps = 65
 
 	// How often to look for the carrier. Ground stations don't move, so this
 	// only has to catch a *different* station keying up.
@@ -892,7 +897,12 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 	var carrierFFT []complex128
 	var carrierWindow *dsp.HannWindow
 	if mode == protocol.ModeAM && cfg.AMCarrierTrack {
-		fineTune = dsp.NewFineTuner(cfg.AMHalfBandwidthHz, decimatedRate, amFilterTaps)
+		// Decimate to the audio rate here instead of in a separate stage: the
+		// narrow filter then computes audioDecim times fewer outputs, and
+		// audioDecimF becomes redundant (its only job was anti-aliased
+		// decimation, which this filter now does with a tighter cutoff).
+		fineTune = dsp.NewFineTuner(cfg.AMHalfBandwidthHz, decimatedRate, amFilterTaps, audioDecim)
+		audioDecimF = nil
 		carrierFFT = make([]complex128, carrierFFTSize)
 		carrierWindow = dsp.NewHannWindow(carrierFFTSize)
 		log.Printf("[dsp] AM carrier tracking on, narrow filter ±%.0f Hz, scan FFT %d bins (%.0f Hz each)",
