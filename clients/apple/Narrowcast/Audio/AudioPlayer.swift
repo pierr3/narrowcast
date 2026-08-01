@@ -1,5 +1,7 @@
 import Foundation
 import AVFoundation
+import QuartzCore
+import NarrowcastClient
 import os
 
 #if canImport(UIKit)
@@ -17,15 +19,14 @@ import UIKit
 //   -> player.scheduleBuffer(buffer)  // engine plays in order
 //
 // The engine drains that queue at the device clock and nothing else, so queue
-// depth *is* the playback latency — and it only moves one way: a stall adds
-// packets that never come back out. Left unmanaged it ratchets, and after a few
-// hiccups playback sits half a second behind the radio for the rest of the
+// depth *is* the playback latency — and it only moves one way on its own: a
+// stall adds packets that never come back out. Left unmanaged it ratchets, and
+// playback ends up sitting a quarter-second behind the radio for the rest of the
 // session, which reads as "laggy" even on a LAN with zero packet loss. So the
 // backlog is tracked explicitly and used for two things:
 //
-//   * Above `maxLatency`, incoming packets are dropped until the backlog is back
-//     down to `targetLatency`. Shedding realtime audio to stay current is the
-//     whole design; buffering it is not.
+//   * Which packets are worth playing at all is decided by PlayoutBudget, which
+//     sheds both bursts past the ceiling and standing latency below it.
 //   * When the backlog reaches zero (squelch closed, transmission over) playback
 //     pauses and the preroll re-arms, so the next transmission starts with a
 //     cushion instead of playing each packet the instant it lands.
@@ -38,13 +39,8 @@ public final class AudioPlayer: @unchecked Sendable {
     private let format: AVAudioFormat
 
     private let prerollPackets: Int
-    /// Backlog ceiling before shedding starts, and the level it sheds down to.
-    /// 400 ms is past where a monitoring listener notices lag; 120 ms is a
-    /// comfortable cushion for wifi jitter.
-    private let maxFrames: Int
-    private let targetFrames: Int
 
-    private let stateLock = OSAllocatedUnfairLock<State>(initialState: State())
+    private let stateLock: OSAllocatedUnfairLock<State>
     /// Transport control issued from the engine's completion callbacks. Kept off
     /// that callback's own queue, which is not somewhere to call back into the
     /// engine from.
@@ -56,9 +52,6 @@ public final class AudioPlayer: @unchecked Sendable {
         var sessionConfigured: Bool = false
         /// Frames scheduled but not yet played back — the current latency.
         var queuedFrames: Int = 0
-        /// True while shedding down to targetFrames after exceeding maxFrames.
-        var shedding: Bool = false
-        var droppedPackets: Int = 0
         /// Bumped on every start/stop transition, and checked by the deferred
         /// pause below. A pause decided when the queue ran dry must not land
         /// after a new transmission has already restarted playback: that leaves
@@ -66,16 +59,29 @@ public final class AudioPlayer: @unchecked Sendable {
         /// again and the backlog never drains — silent for the rest of the
         /// session, with every subsequent packet shed as if it were late.
         var generation: UInt64 = 0
+        /// Decides which packets are worth playing. Pure logic, and tested
+        /// separately — see PlayoutBudget.
+        var budget: PlayoutBudget
     }
 
+    /// - Parameters:
+    ///   - maxLatency: backlog ceiling. 400 ms is past where a monitoring
+    ///     listener notices lag, and generous enough to keep a genuinely lossy
+    ///     link intact, since standing latency is handled separately.
+    ///   - targetLatency: what shedding drains to, and the most standing latency
+    ///     tolerated. 120 ms is a comfortable cushion for wifi jitter.
     public init(sampleRate: Int,
                 prerollPackets: Int = 3,
                 maxLatency: TimeInterval = 0.4,
                 targetLatency: TimeInterval = 0.12) throws {
         self.sampleRate = Double(sampleRate)
         self.prerollPackets = prerollPackets
-        self.maxFrames = Int(Double(sampleRate) * maxLatency)
-        self.targetFrames = Int(Double(sampleRate) * targetLatency)
+        self.stateLock = OSAllocatedUnfairLock(
+            initialState: State(budget: PlayoutBudget(
+                maxFrames: Int(Double(sampleRate) * maxLatency),
+                targetFrames: Int(Double(sampleRate) * targetLatency)
+            ))
+        )
 
         let fmt = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -92,7 +98,7 @@ public final class AudioPlayer: @unchecked Sendable {
     /// Current playback backlog in seconds plus how many packets have been shed
     /// to keep it bounded. Diagnostics only.
     public var latency: (seconds: Double, droppedPackets: Int) {
-        stateLock.withLock { (Double($0.queuedFrames) / sampleRate, $0.droppedPackets) }
+        stateLock.withLock { (Double($0.queuedFrames) / sampleRate, $0.budget.droppedPackets) }
     }
 
     public func stop() {
@@ -102,10 +108,10 @@ public final class AudioPlayer: @unchecked Sendable {
             state.prerolledPackets = 0
             state.playing = false
             state.queuedFrames = 0
-            state.shedding = false
             // Invalidate any pause still queued, so it can't fire against a
             // player that has since been restarted.
             state.generation &+= 1
+            state.budget.reset()
         }
     }
 
@@ -136,17 +142,8 @@ public final class AudioPlayer: @unchecked Sendable {
                 state.sessionConfigured = true
             }
 
-            // Latency guard, with hysteresis between max and target so a burst
-            // is shed once instead of oscillating around the ceiling.
-            if state.shedding {
-                if state.queuedFrames > targetFrames {
-                    state.droppedPackets += 1
-                    return .drop
-                }
-                state.shedding = false
-            } else if state.queuedFrames > maxFrames {
-                state.shedding = true
-                state.droppedPackets += 1
+            guard state.budget.admit(queuedFrames: state.queuedFrames,
+                                     now: CACurrentMediaTime()) else {
                 return .drop
             }
 
@@ -165,19 +162,16 @@ public final class AudioPlayer: @unchecked Sendable {
 
         guard action != .drop else { return }
 
-        // Schedule first, then start the engine. If we started before
-        // scheduling, the engine could spin a tick on an empty player and
-        // mute briefly.
+        // Schedule before starting: the other order can spin the engine a tick on
+        // an empty player and mute briefly. This call is synchronous, so the
+        // buffer is queued by the time anything below runs.
         let frames = samples.count
         player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             self?.framesPlayed(frames)
         }
 
-        // Transport calls go through controlQueue so play and pause can never
-        // run concurrently from the enqueue path and a completion callback.
-        // Scheduling above already happened synchronously, so the buffer is
-        // queued before the engine starts — starting first can spin a tick on an
-        // empty player and mute briefly.
+        // Transport calls go through controlQueue so play and pause can never run
+        // concurrently from the enqueue path and a completion callback.
         if action == .scheduleAndStart {
             controlQueue.async { [weak self] in
                 guard let self else { return }
