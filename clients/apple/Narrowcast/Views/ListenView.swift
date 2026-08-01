@@ -242,21 +242,38 @@ struct LatencyBadge: View {
     let audioMs: Int
     let rttMs: Int?
 
+    // Two labelled values rather than one number and a bare second one. The
+    // unlabelled version was a puzzle: nothing told you which was the delay you
+    // hear and which was the network, and that distinction is the entire reason
+    // both are shown.
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "timer").font(.caption2)
-            Text("\(audioMs) ms")
-                .font(.caption2.monospacedDigit())
+        HStack(spacing: 6) {
+            value("delay", audioMs, tint: color)
             if let rttMs {
-                Text("· \(rttMs)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                value("net", rttMs, tint: .secondary)
             }
         }
-        .foregroundStyle(color)
-        .padding(.horizontal, 6)
+        .padding(.horizontal, 7)
         .padding(.vertical, 2)
         .background(Capsule().fill(Color(.tertiarySystemBackground)))
+    }
+
+    private func value(_ label: String, _ ms: Int, tint: Color) -> some View {
+        HStack(spacing: 3) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Text("\(ms)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(tint)
+            Text("ms")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(label == "delay"
+            ? "Audio delay \(ms) milliseconds"
+            : "Network round trip \(ms) milliseconds")
     }
 
     /// Thresholds match what the audio path allows: the jitter buffer sheds
