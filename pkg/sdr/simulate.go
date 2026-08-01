@@ -22,6 +22,13 @@ type SimulatedDevice struct {
 	signals []simSignal
 }
 
+// dcLeakageI/Q model the tuner's LO leakage. Comparable to a mid-strength
+// signal, which is what makes it able to capture a carrier tracker.
+const (
+	dcLeakageI = 0.12
+	dcLeakageQ = -0.07
+)
+
 // modulation of a simulated signal.
 type modulation int
 
@@ -185,6 +192,16 @@ func (d *SimulatedDevice) ReadAsync(cb func(buf []byte), bufCount, bufSize int) 
 				noiseAmp := 0.05
 				re += noiseAmp * (rand.Float64()*2 - 1)
 				im += noiseAmp * (rand.Float64()*2 - 1)
+
+				// LO leakage. Every zero-IF tuner couples its local oscillator
+				// into the mixer, putting a constant offset in the IQ stream —
+				// a permanent spike at exactly the tuned frequency. Modelling
+				// it matters: without it the simulator quietly flattered the
+				// receiver, and a carrier tracker that locked onto the leakage
+				// instead of the wanted station looked perfect here while
+				// failing on every real dongle.
+				re += dcLeakageI
+				im += dcLeakageQ
 
 				// Convert to CU8
 				buf[2*i] = floatToCU8(re)
