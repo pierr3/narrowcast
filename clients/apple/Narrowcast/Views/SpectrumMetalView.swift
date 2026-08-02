@@ -162,12 +162,18 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         // was up to 60× the necessary main-thread work — and it kept running
         // when the view was off-screen.
         //
-        // Bars are still animated between those frames, which needs display-rate
-        // redraws while they move: `draw` asks for the next one itself as long as
-        // it has somewhere to move to. That keeps the smoothing without giving up
-        // the property that matters — an idle or off-screen view draws nothing.
+        // Bars are animated between those frames, which needs display-rate
+        // redraws while they move. That is done by unpausing the display link
+        // and pausing it again once they arrive — NOT by calling setNeedsDisplay
+        // from inside draw. With enableSetNeedsDisplay there is no display link
+        // to pace that, so re-dirtying the layer from its own draw spins the
+        // runloop as fast as it will go: the UI locks up and the watchdog kills
+        // the app a few seconds later.
         self.isPaused = true
-        self.enableSetNeedsDisplay = true
+        self.enableSetNeedsDisplay = false
+        // 30 is plenty for a bar meter and halves the cost of an animating
+        // spectrum against the display's native rate.
+        self.preferredFramesPerSecond = 30
         self.framebufferOnly = true
         // Transparent so the surrounding card colour shows through.
         self.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
@@ -188,6 +194,7 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
     /// Detach from the store so a torn-down view stops being woken by frames.
     func detach() {
         store.setFrameHandler(nil)
+        isPaused = true
     }
 
     // Redraw only while in the window hierarchy: navigating away should cost
@@ -200,21 +207,35 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
     private func attachIfVisible() {
         guard window != nil else {
             store.setFrameHandler(nil)
+            // Off-screen: stop the display link outright, whatever the bars were
+            // in the middle of doing.
+            isPaused = true
             return
         }
         store.setFrameHandler { [weak self] in
-            // setNeedsDisplay is main-thread only; the store signals off-main.
-            DispatchQueue.main.async { self?.setNeedsDisplay() }
+            // Touching isPaused is main-thread only; the store signals off-main.
+            DispatchQueue.main.async { self?.startAnimating() }
         }
         // Paint once on appearance rather than waiting for the next FFT frame,
         // which under heavy loss can be a second away.
-        setNeedsDisplay()
+        startAnimating()
+    }
+
+    /// Run the display link until the bars have settled. Draw pauses it again.
+    private func startAnimating() {
+        guard window != nil else { return }
+        // Nothing has elapsed from the animation's point of view while it was
+        // stopped, so don't let the gap since the last frame count as decay.
+        if isPaused {
+            lastAnimationTime = CACurrentMediaTime()
+        }
+        isPaused = false
     }
 
     // MARK: - MTKViewDelegate
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        setNeedsDisplay()
+        startAnimating()
     }
 
     func draw(in view: MTKView) {
@@ -225,7 +246,8 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
             let enc = cmd.makeRenderCommandEncoder(descriptor: descriptor)
         else { return }
 
-        if buildBars() {
+        let drewBars = buildBars()
+        if drewBars {
             enc.setRenderPipelineState(barPipeline)
             enc.setVertexBuffer(barBuffer, offset: 0, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: barVertexCount)
@@ -245,13 +267,13 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         cmd.present(drawable)
         cmd.commit()
 
-        // Self-limiting animation. Asking for another frame from inside draw
-        // keeps the view redrawing at display cadence while the bars are still
-        // moving, and stops dead the moment they arrive — so a still spectrum,
-        // or one nobody is looking at, costs exactly what it did before, which a
-        // free-running display link would not.
-        if animating {
-            setNeedsDisplay()
+        // Self-limiting animation: the display link keeps running only while the
+        // bars have somewhere left to move. A still spectrum, or one nobody is
+        // looking at, goes back to costing nothing. Bailing out of buildBars
+        // counts as nothing to animate — otherwise a stale flag could leave the
+        // link running against a view with no geometry.
+        if !drewBars || !animating {
+            isPaused = true
         }
     }
 
