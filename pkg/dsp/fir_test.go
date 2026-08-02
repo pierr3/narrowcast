@@ -1,6 +1,7 @@
 package dsp
 
 import (
+	"fmt"
 	"math"
 	"math/cmplx"
 	"testing"
@@ -253,5 +254,31 @@ func BenchmarkXlatingFilterNFM(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		f.Process(in)
+	}
+}
+
+// How the per-client channel filter scales with capture width. This is the
+// number that decides how many independent VFOs a host can run: everything
+// downstream of it works at the audio rate and is therefore the same cost
+// whatever the capture width, while this stage is paid once per client and
+// scales with the width they are being carved out of.
+//
+// Tap count tracks fs/BW (see NewLowPassFIR's callers), and the number of
+// outputs is fixed by the channel rate, so the cost is linear in capture rate
+// rather than quadratic — which is the difference between this being feasible
+// and not.
+func BenchmarkXlatingFilterByCaptureRate(b *testing.B) {
+	for _, rate := range []int{960_000, 1_920_000, 2_400_000} {
+		b.Run(fmt.Sprintf("%dkS", rate/1000), func(b *testing.B) {
+			// 16 kHz NFM channel, taps scaled to the rate as production does.
+			taps := NewLowPassFIR(8000, float64(rate), 53*rate/(22*16000)|1)
+			f := NewXlatingFilter(0, taps, rate/32000, float64(rate))
+			in := complexRamp(rate * 20 / 1000) // one 20 ms block
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				f.Process(in)
+			}
+		})
 	}
 }
