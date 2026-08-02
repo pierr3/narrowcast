@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/pierr3/narrowcast/pkg/dsp"
 	"github.com/pierr3/narrowcast/pkg/protocol"
 )
 
@@ -78,6 +79,19 @@ type Config struct {
 	// It buys intelligibility, not signal-to-noise: noise in that band is
 	// lifted by exactly as much as the voice. See dsp.PresenceEQ.
 	AMPresenceDb float64
+	// AMNoiseReduction is spectral-subtraction strength: 0 off, 1 light,
+	// 2 medium, 3 strong.
+	//
+	// Measured on real airband traffic, the hiss is flat across 400-2500 Hz and
+	// about 20 dB under the speech — inside the voice passband, where no filter
+	// can reach it. Subtracting a learned noise spectrum per bin can, because
+	// speech occupies any given bin only intermittently while the noise is
+	// always present. See dsp.SpectralNR.
+	//
+	// This is the one stage that can make things sound worse rather than merely
+	// not better: subtract too hard and the residue becomes "musical noise", a
+	// warble of isolated tones. 0 is a true bypass.
+	AMNoiseReduction int
 
 	// Diagnostics
 	PProfAddr string // e.g. "localhost:6060"; empty disables
@@ -122,6 +136,7 @@ func DefaultConfig() *Config {
 		AMCarrierTrack:      true,
 		AMHalfBandwidthHz:   3500,
 		AMPresenceDb:        5,
+		AMNoiseReduction:    int(dsp.NRMedium),
 	}
 }
 
@@ -150,6 +165,8 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 		"half-bandwidth in Hz of the narrow AM filter once centred on the carrier")
 	fs.Float64Var(&c.AMPresenceDb, "am-presence", c.AMPresenceDb,
 		"dB of presence lift on the AM consonant band (~2 kHz); 0 disables")
+	fs.IntVar(&c.AMNoiseReduction, "am-nr", c.AMNoiseReduction,
+		"AM noise reduction: 0 off, 1 light, 2 medium, 3 strong")
 	fs.BoolVar(&c.AudioSeq, "audio-seq", c.AudioSeq, "Send sequence-numbered audio datagrams (needed for client-side Opus FEC)")
 	fs.StringVar(&c.PProfAddr, "pprof", c.PProfAddr, "Serve net/http/pprof on this address (e.g. localhost:6060); empty disables")
 }
@@ -188,6 +205,9 @@ func (c *Config) Validate() error {
 	}
 	if c.OpusBitrate < 6000 {
 		return fmt.Errorf("opus-bitrate %d is below the usable Opus minimum (6000)", c.OpusBitrate)
+	}
+	if c.AMNoiseReduction < 0 || c.AMNoiseReduction > 3 {
+		return fmt.Errorf("am-nr must be 0 (off), 1 (light), 2 (medium) or 3 (strong), got %d", c.AMNoiseReduction)
 	}
 	if c.AMPresenceDb < 0 || c.AMPresenceDb > 12 {
 		return fmt.Errorf("am-presence must be between 0 and 12 dB, got %.1f", c.AMPresenceDb)

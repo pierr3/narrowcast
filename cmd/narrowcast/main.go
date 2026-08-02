@@ -630,6 +630,7 @@ type dspChain struct {
 	voiceHPF    *dsp.HighPassIIR   // voice bandpass high-pass (AM only)
 	voiceLPF    *dsp.RealFIRFilter // voice bandpass low-pass (AM only)
 	presence    *dsp.PresenceEQ    // consonant-band lift (AM only)
+	nr          *dsp.SpectralNR    // spectral-subtraction noise reduction (AM only)
 	limiter     *dsp.SoftLimiter   // soft clipper for ADC saturation
 	gain        gainStage          // AGC (FM) or hang-time AudioAGC (AM)
 	squelch     *dsp.Squelch       // gates on channel power, not audio level
@@ -686,6 +687,10 @@ func (c *dspChain) Reset() {
 	}
 	if c.presence != nil {
 		c.presence.Reset()
+	}
+	if c.nr != nil {
+		// The learned noise spectrum belongs to the channel that was tuned.
+		c.nr.Reset()
 	}
 	if c.gain != nil {
 		c.gain.Reset()
@@ -841,6 +846,12 @@ func (c *dspChain) demodBlock(iq []complex128, squelchDb float64, tunedHz uint64
 	if c.presence != nil {
 		c.presence.Process(audio)
 	}
+	// Noise reduction last. `open` is what tells it which blocks are noise: the
+	// squelch has already made that call on channel power, so there is no need
+	// to re-infer it from the audio, and speech can never be learned as noise.
+	if c.nr != nil {
+		audio = c.nr.Process(audio, !open)
+	}
 	return audio, channelPowerDb, open
 }
 
@@ -957,6 +968,15 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		log.Printf("[dsp] AM voice cleanup: bandpass 400-3000 Hz")
 	}
 
+	// Noise reduction, applied after the presence lift so it also takes back
+	// the noise that lift adds at 2 kHz, while leaving the consonants it was
+	// aimed at. Learns its noise spectrum from squelch-closed blocks.
+	var nr *dsp.SpectralNR
+	if mode == protocol.ModeAM && cfg.AMNoiseReduction > 0 {
+		nr = dsp.NewSpectralNR(dsp.NRLevel(cfg.AMNoiseReduction))
+		log.Printf("[dsp] AM noise reduction: level %d", cfg.AMNoiseReduction)
+	}
+
 	// Presence lift, inside the band the voice filter passes. Placed before the
 	// AGC so the level the AGC normalises is the level that actually leaves.
 	var presence *dsp.PresenceEQ
@@ -1027,6 +1047,7 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		voiceHPF:    voiceHPF,
 		voiceLPF:    voiceLPF,
 		presence:    presence,
+		nr:          nr,
 		limiter:     limiter,
 		gain:        gain,
 		squelch:     squelch,

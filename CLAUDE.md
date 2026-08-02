@@ -70,6 +70,7 @@ CU8 IQ → DC block (tuner LO leakage) → xlating FIR (mix + decimate) → demo
        → de-emphasis (FM)
        → voice bandpass 400-3000 Hz (AM only)
        → presence lift ~2 kHz (AM)
+       → spectral-subtraction noise reduction (AM)
        → AGC (FM regular / AM hang-time AudioAGC)
        → Opus encode → QUIC datagrams
 ```
