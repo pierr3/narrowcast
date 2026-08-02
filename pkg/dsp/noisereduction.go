@@ -52,11 +52,18 @@ func (l NRLevel) settings() nrSettings {
 // can, because speech occupies any given bin only some of the time while the
 // noise is always there.
 //
-// The noise estimate comes from blocks where the squelch is shut, which is the
-// same trick IQDCBlocker and the client's squelch calibrator use: the gate has
-// already decided when there is no signal, so there is no need to infer it
-// again from the audio. The estimate freezes while the gate is open, so speech
-// can never be learned as noise.
+// The noise estimate is a per-bin minimum tracked over ~1.6 s while the gate is
+// open, which is longer than any syllable, so what it measures is the floor
+// underneath the speech rather than the speech.
+//
+// The obvious alternative — learn during a closed squelch, as IQDCBlocker does
+// — was tried first and is wrong here. A closed squelch means no carrier, and
+// envelope detection gives noise a different magnitude and shape depending on
+// whether there is a carrier for it to ride on. An estimate taken from dead air
+// therefore mis-describes the noise present during a transmission, which is the
+// only time it is ever used. On real air that mistake cost about 10 dB of the
+// available reduction. Closed-squelch frames are still used, but only to seed
+// something usable before the first minimum window has filled.
 //
 // This is the one stage in the chain that can make things sound worse rather
 // than merely not better, which is why NROff is a true bypass.
@@ -66,9 +73,17 @@ type SpectralNR struct {
 	fftSize  int
 	hop      int
 	window   []float64
-	noiseMag []float64 // per-bin noise magnitude estimate
+	noiseMag []float64 // per-bin noise magnitude estimate in use
 	gain     []float64 // per-bin gain, smoothed over time
-	learned  int
+	learned  int       // squelch-closed frames seen (bootstrap only)
+
+	// Minimum statistics, tracked while the gate is OPEN. See noteMinimum.
+	smoothPow []float64   // variance-reduced power per bin
+	subMin    [][]float64 // ring of per-sub-window minima
+	curMin    []float64   // minimum accumulating in the current sub-window
+	subIdx    int         // which ring slot the current sub-window fills
+	subCount  int         // frames into the current sub-window
+	subFilled int         // ring slots populated so far
 
 	// Input waiting to be framed, and output accumulated by overlap-add.
 	inBuf  []float64
@@ -95,6 +110,25 @@ const (
 	// subtraction happens. Subtracting a half-formed estimate is worse than
 	// leaving the audio alone.
 	nrMinLearnFrames = 20
+
+	// Minimum statistics. The per-bin minimum of a smoothed power spectrum over
+	// a window longer than any syllable is, by construction, a measurement of
+	// the noise floor and not of the speech on top of it.
+	//
+	// This is what the noise estimate is really built from, because the obvious
+	// alternative does not work for AM. Learning during a closed squelch means
+	// learning with no carrier present, and envelope detection gives noise a
+	// different magnitude and shape depending on whether a carrier is there to
+	// ride on. An estimate taken from dead air therefore mis-describes the noise
+	// during a transmission, which is the only time it gets used.
+	nrSubWindowFrames = 48 // ~0.4 s at 16 kHz with a 128-sample hop
+	nrSubWindows      = 4  // so the minimum spans ~1.6 s
+	// nrPowSmoothing averages the periodogram before minima are taken; without
+	// it the minimum of a noisy estimate sits well below the true floor.
+	nrPowSmoothing = 0.7
+	// nrMinBias compensates for what is left of that downward bias. The minimum
+	// of even a smoothed spectrum still underestimates its mean.
+	nrMinBias = 1.5
 )
 
 // NewSpectralNR builds a noise reducer for the given audio rate.
@@ -106,16 +140,24 @@ func NewSpectralNR(level NRLevel) *SpectralNR {
 		// needs no synthesis window and no normalisation.
 		w[i] = 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(n))
 	}
+	bins := n/2 + 1
 	nr := &SpectralNR{
-		level:    level,
-		set:      level.settings(),
-		fftSize:  n,
-		hop:      n / 2,
-		window:   w,
-		noiseMag: make([]float64, n/2+1),
-		gain:     make([]float64, n/2+1),
-		frame:    make([]complex128, n),
+		level:     level,
+		set:       level.settings(),
+		fftSize:   n,
+		hop:       n / 2,
+		window:    w,
+		noiseMag:  make([]float64, bins),
+		gain:      make([]float64, bins),
+		frame:     make([]complex128, n),
+		smoothPow: make([]float64, bins),
+		curMin:    make([]float64, bins),
 	}
+	nr.subMin = make([][]float64, nrSubWindows)
+	for i := range nr.subMin {
+		nr.subMin[i] = make([]float64, bins)
+	}
+	nr.resetMinima()
 	for i := range nr.gain {
 		nr.gain[i] = 1
 	}
@@ -131,9 +173,76 @@ func (s *SpectralNR) SetLevel(l NRLevel) {
 // Level reports the current strength.
 func (s *SpectralNR) Level() NRLevel { return s.level }
 
-// Ready reports whether enough noise-only audio has been seen to subtract
-// anything yet.
-func (s *SpectralNR) Ready() bool { return s.learned >= nrMinLearnFrames }
+// Ready reports whether there is an estimate worth subtracting yet.
+func (s *SpectralNR) Ready() bool {
+	return s.subFilled > 0 || s.learned >= nrMinLearnFrames
+}
+
+// resetMinima clears the minimum tracker.
+func (s *SpectralNR) resetMinima() {
+	for i := range s.curMin {
+		s.curMin[i] = math.Inf(1)
+	}
+	for _, w := range s.subMin {
+		for i := range w {
+			w[i] = math.Inf(1)
+		}
+	}
+	s.subIdx, s.subCount, s.subFilled = 0, 0, 0
+	for i := range s.smoothPow {
+		s.smoothPow[i] = 0
+	}
+}
+
+// noteMinimum folds one frame's spectrum into the minimum tracker and refreshes
+// the noise estimate from it.
+//
+// Smoothing the periodogram first matters: the minimum of a raw, noisy estimate
+// sits far below the true floor, and the whole method depends on the minimum
+// being a fair measurement of it.
+func (s *SpectralNR) noteMinimum(half int) {
+	for k := 0; k <= half; k++ {
+		re, im := real(s.frame[k]), imag(s.frame[k])
+		p := re*re + im*im
+		if s.smoothPow[k] == 0 {
+			s.smoothPow[k] = p
+		} else {
+			s.smoothPow[k] = nrPowSmoothing*s.smoothPow[k] + (1-nrPowSmoothing)*p
+		}
+		if s.smoothPow[k] < s.curMin[k] {
+			s.curMin[k] = s.smoothPow[k]
+		}
+	}
+
+	s.subCount++
+	if s.subCount < nrSubWindowFrames {
+		return
+	}
+	// Close this sub-window and rotate.
+	copy(s.subMin[s.subIdx], s.curMin)
+	s.subIdx = (s.subIdx + 1) % nrSubWindows
+	s.subCount = 0
+	if s.subFilled < nrSubWindows {
+		s.subFilled++
+	}
+	for i := range s.curMin {
+		s.curMin[i] = math.Inf(1)
+	}
+
+	// Estimate is the smallest sub-window minimum, bias-corrected.
+	for k := 0; k <= half; k++ {
+		best := math.Inf(1)
+		for w := 0; w < s.subFilled; w++ {
+			if v := s.subMin[w][k]; v < best {
+				best = v
+			}
+		}
+		if math.IsInf(best, 1) {
+			continue
+		}
+		s.noiseMag[k] = nrMinBias * math.Sqrt(best)
+	}
+}
 
 // Process runs one block. When learnNoise is true the block is taken to be
 // noise only — the caller guarantees this by only setting it while the squelch
@@ -175,18 +284,25 @@ func (s *SpectralNR) analyse(learnNoise bool) {
 	FFT(s.frame)
 
 	if learnNoise {
-		for k := 0; k <= half; k++ {
-			mag := cabs(s.frame[k])
-			if s.learned == 0 {
-				s.noiseMag[k] = mag
-			} else {
-				s.noiseMag[k] += nrNoiseAlpha * (mag - s.noiseMag[k])
+		// Bootstrap only, and only until the minimum tracker has something. See
+		// the type comment for why dead air is the wrong teacher for AM.
+		if s.subFilled == 0 {
+			for k := 0; k <= half; k++ {
+				mag := cabs(s.frame[k])
+				if s.learned == 0 {
+					s.noiseMag[k] = mag
+				} else {
+					s.noiseMag[k] += nrNoiseAlpha * (mag - s.noiseMag[k])
+				}
+			}
+			if s.learned < nrMinLearnFrames {
+				s.learned++
 			}
 		}
-		if s.learned < nrMinLearnFrames {
-			s.learned++
-		}
-	} else if s.Ready() {
+	} else {
+		s.noteMinimum(half)
+	}
+	if !learnNoise && s.Ready() {
 		for k := 0; k <= half; k++ {
 			mag := cabs(s.frame[k])
 			target := s.set.floorGain
@@ -242,6 +358,7 @@ func (s *SpectralNR) Reset() {
 	s.outBuf = s.outBuf[:0]
 	s.ready = 0
 	s.learned = 0
+	s.resetMinima()
 	for i := range s.noiseMag {
 		s.noiseMag[i] = 0
 	}
