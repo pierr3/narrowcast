@@ -65,9 +65,38 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
     // Static centre-frequency marker.
     private var decorBuffer: MTLBuffer
 
-    // Scratch for the store read, sized to the current bar count.
+    // Scratch for the store read, sized to the current bar count. These are the
+    // targets; shownLevels/shownPeaks are what is actually on screen, easing
+    // toward them.
     private var levels: [Float] = []
     private var peaks: [Float] = []
+    private var shownLevels: [Float] = []
+    private var shownPeaks: [Float] = []
+
+    /// True while the displayed bars have not yet caught up with the targets.
+    /// `draw` requests another frame while this holds, which is what animates
+    /// them — see the note on `isPaused` in init for why there is no free
+    /// running display link.
+    private var animating = false
+    private var lastAnimationTime: CFTimeInterval = 0
+    /// Set once the store has produced a frame; before that there is nothing to
+    /// draw at all.
+    private var hasData = false
+
+    // Easing time constants. Attack is quick so a transmission appears the
+    // instant it starts; decay is slower because a bar dropping like a stone
+    // reads as a glitch rather than a signal ending. This asymmetry is what
+    // spectrum analysers have always done, and it beats a symmetric lerp, which
+    // either feels sluggish on the way up or twitchy on the way down.
+    private let attackTau: Float = 0.03
+    private let decayTau: Float = 0.15
+    /// Peak caps get smoothing only on the way down, and only enough to hide the
+    /// frame steps — the hold-and-decay behaviour itself belongs to SpectrumStore
+    /// and must not be applied twice.
+    private let peakDecayTau: Float = 0.10
+    /// Below this, further easing is invisible, so the animation stops and the
+    /// view goes back to costing nothing.
+    private let convergenceEpsilon: Float = 0.002
 
     /// Matches `BarVertex` in Shaders.metal. `pad` keeps `color` at offset 16.
     private struct BarVertex {
@@ -132,6 +161,11 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         // Draw on demand. The FFT arrives at 1-10 fps, so a 60 fps display link
         // was up to 60× the necessary main-thread work — and it kept running
         // when the view was off-screen.
+        //
+        // Bars are still animated between those frames, which needs display-rate
+        // redraws while they move: `draw` asks for the next one itself as long as
+        // it has somewhere to move to. That keeps the smoothing without giving up
+        // the property that matters — an idle or off-screen view draws nothing.
         self.isPaused = true
         self.enableSetNeedsDisplay = true
         self.framebufferOnly = true
@@ -210,6 +244,15 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         enc.endEncoding()
         cmd.present(drawable)
         cmd.commit()
+
+        // Self-limiting animation. Asking for another frame from inside draw
+        // keeps the view redrawing at display cadence while the bars are still
+        // moving, and stops dead the moment they arrive — so a still spectrum,
+        // or one nobody is looking at, costs exactly what it did before, which a
+        // free-running display link would not.
+        if animating {
+            setNeedsDisplay()
+        }
     }
 
     // MARK: - Geometry
@@ -223,8 +266,29 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         if levels.count != count {
             levels = Array(repeating: 0, count: count)
             peaks = Array(repeating: 0, count: count)
+            shownLevels = levels
+            shownPeaks = peaks
         }
-        guard store.readBars(level: &levels, peak: &peaks) else { return false }
+
+        // readBars reports the store's current smoothed state rather than
+        // consuming a frame, so it succeeds on every draw once anything has
+        // arrived — which is exactly what lets this run between FFT frames. A
+        // false result means the store was cleared (disconnect), so drop what is
+        // on screen instead of leaving the last spectrum frozen there.
+        guard store.readBars(level: &levels, peak: &peaks) else {
+            if hasData {
+                hasData = false
+                animating = false
+                for i in 0..<count {
+                    shownLevels[i] = 0
+                    shownPeaks[i] = 0
+                }
+            }
+            return false
+        }
+        hasData = true
+
+        animate(count: count)
 
         let slot = 1 / Float(count)
         let gap = slot * gapFraction
@@ -248,8 +312,8 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
         for i in 0..<count {
             let x0 = Float(i) * slot + gap * 0.5
             let x1 = Float(i + 1) * slot - gap * 0.5
-            let level = levels[i]
-            let peak = peaks[i]
+            let level = shownLevels[i]
+            let peak = shownPeaks[i]
 
             // Colour by level so activity reads without checking the height,
             // with the tuned (centre) bar tinted so it's findable at a glance.
@@ -275,6 +339,52 @@ final class MetalSpectrumView: MTKView, MTKViewDelegate {
 
         barVertexCount = v
         return v > 0
+    }
+
+    /// Ease the displayed bars toward the targets, and record whether they have
+    /// arrived.
+    ///
+    /// The step is derived from elapsed time rather than being a fixed
+    /// per-frame fraction, so the bars fall at the same rate on a 60 Hz phone,
+    /// a 120 Hz one, and the first frame after the view has been idle. A fixed
+    /// coefficient would make the animation speed a property of the hardware.
+    private func animate(count: Int) {
+        let now = CACurrentMediaTime()
+        // Clamp: after an idle spell the gap is arbitrarily long, and without a
+        // bound the first frame back would be a no-op smoothing-wise anyway —
+        // this just keeps the exponentials well-behaved.
+        let dt = Float(min(max(now - lastAnimationTime, 0), 0.1))
+        lastAnimationTime = now
+
+        // 1 - exp(-dt/tau) is the exact per-step fraction for an exponential
+        // approach, which is what makes this frame-rate independent.
+        let attack = 1 - exp(-dt / attackTau)
+        let decay = 1 - exp(-dt / decayTau)
+        let peakDecay = 1 - exp(-dt / peakDecayTau)
+
+        var settled = true
+        for i in 0..<count {
+            let targetLevel = levels[i]
+            var shown = shownLevels[i]
+            let k = targetLevel > shown ? attack : decay
+            shown += (targetLevel - shown) * k
+            if abs(targetLevel - shown) > convergenceEpsilon { settled = false }
+            shownLevels[i] = shown
+
+            // Peaks rise immediately — the store has already decided where the
+            // cap belongs, and lagging it upward would show a cap below its own
+            // bar.
+            let targetPeak = peaks[i]
+            var shownPeak = shownPeaks[i]
+            if targetPeak >= shownPeak {
+                shownPeak = targetPeak
+            } else {
+                shownPeak += (targetPeak - shownPeak) * peakDecay
+                if abs(targetPeak - shownPeak) > convergenceEpsilon { settled = false }
+            }
+            shownPeaks[i] = shownPeak
+        }
+        animating = !settled
     }
 
     private func mix(low: SIMD4<Float>, high: SIMD4<Float>, t: Float) -> SIMD4<Float> {
