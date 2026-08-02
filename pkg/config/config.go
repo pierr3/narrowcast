@@ -70,6 +70,14 @@ type Config struct {
 	// AMHalfBandwidthHz is the narrow filter's half-bandwidth once centred.
 	// Aviation AM voice occupies roughly ±3.5 kHz.
 	AMHalfBandwidthHz float64
+	// AMPresenceDb lifts the consonant band of AM voice; 0 disables.
+	//
+	// Airband AM is inherently muffled, and consonants are distinguished almost
+	// entirely by energy between ~1.5 and 3 kHz, so a broad boost there is most
+	// of what makes a communications receiver sound crisp rather than woolly.
+	// It buys intelligibility, not signal-to-noise: noise in that band is
+	// lifted by exactly as much as the voice. See dsp.PresenceEQ.
+	AMPresenceDb float64
 
 	// Diagnostics
 	PProfAddr string // e.g. "localhost:6060"; empty disables
@@ -113,6 +121,7 @@ func DefaultConfig() *Config {
 		AudioSeq:            true,
 		AMCarrierTrack:      true,
 		AMHalfBandwidthHz:   3500,
+		AMPresenceDb:        5,
 	}
 }
 
@@ -139,6 +148,8 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 		"follow the transmitting carrier within an AM channel and filter narrowly around it")
 	fs.Float64Var(&c.AMHalfBandwidthHz, "am-bandwidth", c.AMHalfBandwidthHz,
 		"half-bandwidth in Hz of the narrow AM filter once centred on the carrier")
+	fs.Float64Var(&c.AMPresenceDb, "am-presence", c.AMPresenceDb,
+		"dB of presence lift on the AM consonant band (~2 kHz); 0 disables")
 	fs.BoolVar(&c.AudioSeq, "audio-seq", c.AudioSeq, "Send sequence-numbered audio datagrams (needed for client-side Opus FEC)")
 	fs.StringVar(&c.PProfAddr, "pprof", c.PProfAddr, "Serve net/http/pprof on this address (e.g. localhost:6060); empty disables")
 }
@@ -177,6 +188,9 @@ func (c *Config) Validate() error {
 	}
 	if c.OpusBitrate < 6000 {
 		return fmt.Errorf("opus-bitrate %d is below the usable Opus minimum (6000)", c.OpusBitrate)
+	}
+	if c.AMPresenceDb < 0 || c.AMPresenceDb > 12 {
+		return fmt.Errorf("am-presence must be between 0 and 12 dB, got %.1f", c.AMPresenceDb)
 	}
 	if c.OpusComplexity < 0 || c.OpusComplexity > 10 {
 		return fmt.Errorf("opus-complexity must be between 0 and 10, got %d", c.OpusComplexity)

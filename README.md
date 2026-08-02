@@ -181,6 +181,7 @@ narrowcast [flags]
   --squelch-hang        ms to hold the gate open after signal drops (default: 500)
   --am-carrier-track    Follow the carrier within an AM channel (default: true)
   --am-bandwidth        Narrow AM filter half-bandwidth in Hz (default: 3500)
+  --am-presence         dB of presence lift on the AM consonant band (default: 5, 0 disables)
   --opus-bitrate  Opus bitrate in bps (default: 32000)
   --opus-complexity     Opus encoder complexity 0-10 (default: 5)
   --audio-seq     Sequence-numbered audio datagrams (default: true)

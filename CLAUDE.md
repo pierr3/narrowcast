@@ -64,11 +64,12 @@ When extending the protocol: assign a new type byte, document the payload layout
 `cmd/narrowcast/main.go` is the orchestrator. The DSP chain is built per-mode in `buildDSPChain()`:
 
 ```
-CU8 IQ → xlating FIR (mix + decimate) → demod (FM/AM)
+CU8 IQ → DC block (tuner LO leakage) → xlating FIR (mix + decimate) → demod (FM/AM)
        → soft limiter (FM only)
        → audio decimation FIR (anti-aliased)
        → de-emphasis (FM)
        → voice bandpass 400-3000 Hz (AM only)
+       → presence lift ~2 kHz (AM)
        → AGC (FM regular / AM hang-time AudioAGC)
        → Opus encode → QUIC datagrams
 ```

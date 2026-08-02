@@ -151,3 +151,80 @@ func TestAMOutputSNRVsChannelSNR(t *testing.T) {
 			sigma, channelSNR, out)
 	}
 }
+
+// twoToneAM modulates the carrier with two equal tones at once. Measuring the
+// ratio between them at the output is the only honest way to see a shaping
+// filter through an AGC: with a single tone the AGC simply normalises whatever
+// the filter did and the effect vanishes from the measurement.
+func twoToneAM(n int, phase, mod *float64, loHz, hiHz, noiseSigma float64, rng *rand.Rand) []complex128 {
+	out := make([]complex128, n)
+	for i := range out {
+		*mod += 2 * math.Pi / amTestRate
+		lo := math.Sin(*mod * loHz)
+		hi := math.Sin(*mod * hiHz)
+		env := 1 + 0.35*(lo+hi)
+		re := env*math.Cos(*phase) + rng.NormFloat64()*noiseSigma
+		im := env*math.Sin(*phase) + rng.NormFloat64()*noiseSigma
+		out[i] = complex(re, im)
+	}
+	return out
+}
+
+// The presence lift has to reach the audio, apply to AM only, and land on the
+// consonant band rather than the vowel body.
+func TestAMPresenceLiftsConsonantsRelativeToVowels(t *testing.T) {
+	const loHz, hiHz = 700.0, 2400.0
+
+	ratio := func(presenceDb float64) float64 {
+		cfg := config.DefaultConfig()
+		cfg.SampleRate = amTestRate
+		cfg.SquelchDBm = -200
+		cfg.AMPresenceDb = presenceDb
+
+		chain, err := buildDSPChain(protocol.ModeAM, cfg, cfg.OpusBitrate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rng := rand.New(rand.NewSource(7))
+		var phase, mod float64
+		var audio []float64
+		const blocks = 40
+		for b := 0; b < blocks; b++ {
+			iq := twoToneAM(amBlockLen, &phase, &mod, loHz, hiHz, 0.02, rng)
+			out, _, open := chain.demodBlock(iq, float64(cfg.SquelchDBm), 125_500_000, testClock(b))
+			if !open {
+				t.Fatal("squelch closed with the threshold at -200 dBm")
+			}
+			if b >= blocks/2 {
+				audio = append(audio, out...)
+			}
+		}
+		lo := goertzel(audio, loHz, amAudioRate)
+		hi := goertzel(audio, hiHz, amAudioRate)
+		return 10 * math.Log10(hi/lo)
+	}
+
+	off := ratio(0)
+	on := ratio(5)
+	t.Logf("2400/700 Hz ratio: %.2f dB with presence off, %.2f dB on (lift %.2f dB)",
+		off, on, on-off)
+
+	if lift := on - off; lift < 2.0 || lift > 6.0 {
+		t.Errorf("presence changed the consonant/vowel ratio by %.2f dB, want ~3-5", lift)
+	}
+}
+
+// Filters added for the airband must not touch the other modes.
+func TestPresenceIsAMOnly(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.SampleRate = amTestRate
+	for _, m := range []protocol.DemodMode{protocol.ModeNFM, protocol.ModeWFM} {
+		chain, err := buildDSPChain(m, cfg, cfg.OpusBitrate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chain.presence != nil {
+			t.Errorf("%s built a presence filter", m)
+		}
+	}
+}

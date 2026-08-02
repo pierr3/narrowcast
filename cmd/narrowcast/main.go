@@ -629,6 +629,7 @@ type dspChain struct {
 	audioDecimF *dsp.RealFIRFilter // anti-aliased decimation filter (nil if no decimation needed)
 	voiceHPF    *dsp.HighPassIIR   // voice bandpass high-pass (AM only)
 	voiceLPF    *dsp.RealFIRFilter // voice bandpass low-pass (AM only)
+	presence    *dsp.PresenceEQ    // consonant-band lift (AM only)
 	limiter     *dsp.SoftLimiter   // soft clipper for ADC saturation
 	gain        gainStage          // AGC (FM) or hang-time AudioAGC (AM)
 	squelch     *dsp.Squelch       // gates on channel power, not audio level
@@ -683,6 +684,9 @@ func (c *dspChain) Reset() {
 	if c.voiceLPF != nil {
 		c.voiceLPF.Reset()
 	}
+	if c.presence != nil {
+		c.presence.Reset()
+	}
 	if c.gain != nil {
 		c.gain.Reset()
 	}
@@ -722,6 +726,13 @@ const (
 	// expensive number in the AM chain; 161 taps measured *more* costly than the
 	// entire wideband channel filter.
 	amFilterTaps = 65
+
+	// Presence lift geometry. 2 kHz sits in the middle of the consonant band,
+	// and Q 0.9 spreads the boost across roughly 1.2-3.3 kHz — matched to what
+	// the 400-3000 Hz voice bandpass actually passes, so none of it is spent
+	// on frequencies that get removed straight afterwards.
+	amPresenceHz = 2000.0
+	amPresenceQ  = 0.9
 
 	// How often to look for the carrier. Ground stations don't move, so this
 	// only has to catch a *different* station keying up.
@@ -824,6 +835,11 @@ func (c *dspChain) demodBlock(iq []complex128, squelchDb float64, tunedHz uint64
 	}
 	if c.voiceLPF != nil {
 		audio = c.voiceLPF.Process(audio)
+	}
+	// Lift the consonants last, so it shapes the band the voice filter kept
+	// rather than boosting energy that is about to be filtered away.
+	if c.presence != nil {
+		c.presence.Process(audio)
 	}
 	return audio, channelPowerDb, open
 }
@@ -941,6 +957,15 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		log.Printf("[dsp] AM voice cleanup: bandpass 400-3000 Hz")
 	}
 
+	// Presence lift, inside the band the voice filter passes. Placed before the
+	// AGC so the level the AGC normalises is the level that actually leaves.
+	var presence *dsp.PresenceEQ
+	if mode == protocol.ModeAM && cfg.AMPresenceDb > 0 {
+		presence = dsp.NewPresenceEQ(amPresenceHz, amPresenceQ, cfg.AMPresenceDb, float64(audioRate))
+		log.Printf("[dsp] AM presence: +%.1f dB at %.0f Hz (Q %.1f)",
+			cfg.AMPresenceDb, amPresenceHz, amPresenceQ)
+	}
+
 	// Soft limiter to tame ADC-saturated signals (drive=2.0 = moderate compression)
 	// Skip for AM — amplitude IS the audio, so tanh compression distorts the voice.
 	var limiter *dsp.SoftLimiter
@@ -1001,6 +1026,7 @@ func buildDSPChain(mode protocol.DemodMode, cfg *config.Config, opusBitrate int)
 		audioDecimF: audioDecimF,
 		voiceHPF:    voiceHPF,
 		voiceLPF:    voiceLPF,
+		presence:    presence,
 		limiter:     limiter,
 		gain:        gain,
 		squelch:     squelch,
