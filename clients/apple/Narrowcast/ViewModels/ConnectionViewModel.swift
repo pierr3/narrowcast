@@ -189,6 +189,9 @@ final class ConnectionViewModel: ObservableObject {
         squelchSendTask = nil
         gainSendTask?.cancel()
         gainSendTask = nil
+        // No status frames are coming, so a calibration would sit at zero
+        // samples until it timed out.
+        cancelCalibration()
         pipelineHolder.stop()
         connectedServerId = nil
         // Don't leave a stale needle, spectrum or readout behind on reconnect.
@@ -230,6 +233,9 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     func setFrequency(_ hz: UInt64) {
+        // Samples taken before a retune describe a different channel, so they
+        // can't be pooled with the ones after it.
+        cancelCalibration()
         freqHz = hz // optimistic; reconciled once the server echoes it back
         pendingFreq = PendingEdit(hz)
         refreshNowPlaying()
@@ -237,6 +243,9 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     func setMode(_ m: DemodMode) {
+        // A mode change changes the channel bandwidth, and therefore the noise
+        // power the samples were measuring.
+        cancelCalibration()
         mode = m
         refreshNowPlaying()
         Task { try? await client?.send(.setMode(m)) }
@@ -274,6 +283,80 @@ final class ConnectionViewModel: ObservableObject {
     private var pendingSquelch: PendingEdit<Float>?
     private var pendingFreq: PendingEdit<UInt64>?
 
+    // MARK: - Squelch calibration
+
+    /// Progress of an in-flight auto-squelch, for the UI to render. nil when
+    /// idle.
+    @Published private(set) var calibration: CalibrationState?
+
+    struct CalibrationState: Equatable {
+        var secondsRemaining: Int
+        /// Set once finished, so the result can be shown briefly.
+        var finished: SquelchCalibrator.Result?
+    }
+
+    /// Sampling window. At the 10 Hz status rate this is ~30 samples, plenty for
+    /// a stable percentile and short enough not to feel like a wait.
+    private static let calibrationSeconds = 3
+
+    private var calibrator: SquelchCalibrator?
+    private var calibrationTask: Task<Void, Never>?
+
+    /// Measure the noise floor and put the squelch just above it.
+    ///
+    /// Everything needed is already arriving: the S-meter in each status frame
+    /// is the very quantity the gate compares against, so this needs no server
+    /// support. See SquelchCalibrator.
+    func autoSquelch() {
+        guard state == .connected else { return }
+        calibrationTask?.cancel()
+        calibrator = SquelchCalibrator()
+        calibration = CalibrationState(secondsRemaining: Self.calibrationSeconds)
+
+        calibrationTask = Task { [weak self] in
+            for remaining in stride(from: Self.calibrationSeconds - 1, through: 0, by: -1) {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                guard let self, self.calibration != nil else { return }
+                self.calibration?.secondsRemaining = remaining
+            }
+            guard let self else { return }
+            self.finishCalibration()
+        }
+    }
+
+    /// Abandon a calibration in progress. Called when the samples stop being
+    /// comparable — a retune or mode change moves the channel, and therefore the
+    /// noise power, out from under them — or when the user takes manual control.
+    func cancelCalibration() {
+        calibrationTask?.cancel()
+        calibrationTask = nil
+        calibrator = nil
+        calibration = nil
+    }
+
+    private func finishCalibration() {
+        defer {
+            calibrator = nil
+            calibrationTask = nil
+        }
+        guard let result = calibrator?.result else {
+            // Too few status frames to be worth acting on — say so rather than
+            // setting a threshold from noise.
+            calibration = nil
+            return
+        }
+        applySquelch(result.thresholdDb)
+        calibration = CalibrationState(secondsRemaining: 0, finished: result)
+
+        // Leave the result on screen briefly so it can be read, then clear.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard let self, self.calibration?.finished == result else { return }
+            self.calibration = nil
+        }
+    }
+
     /// Whether a server-reported value should be applied to the UI. Clears the
     /// pending edit once the server agrees (or the wait times out), so normal
     /// server-driven updates resume.
@@ -287,6 +370,13 @@ final class ConnectionViewModel: ObservableObject {
     }
 
     func setSquelch(_ db: Float) {
+        // Touching the slider is taking manual control; a calibration that
+        // landed afterwards would yank the value out from under it.
+        cancelCalibration()
+        applySquelch(db)
+    }
+
+    private func applySquelch(_ db: Float) {
         squelchDb = db
         pendingSquelch = PendingEdit(db)
         squelchSendTask?.cancel()
@@ -430,6 +520,10 @@ final class ConnectionViewModel: ObservableObject {
             // Only the meter changes on every frame; it lives on its own
             // observable object so this doesn't invalidate the whole view.
             meter.update(db: s)
+
+            // The S-meter is the squelch's own measurement, which is what makes
+            // calibrating from it correct rather than approximate.
+            calibrator?.add(powerDb: s)
 
             // Everything below is echoed back unchanged most of the time, so
             // guard each assignment: an unconditional write to a @Published

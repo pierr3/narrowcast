@@ -131,10 +131,7 @@ struct ListenView: View {
             HStack {
                 Text("Squelch").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                // One decimal: the value was always fractional, the readout just
-                // hid it by rounding to Int.
-                Text(String(format: "%.1f dB", vm.squelchDb))
-                    .font(.caption).monospacedDigit()
+                squelchStatus
             }
             HStack(spacing: 10) {
                 squelchNudge(-Self.squelchStep, icon: "minus")
@@ -143,8 +140,55 @@ struct ListenView: View {
                     set: { vm.setSquelch(Float($0)) }
                 ), in: -120...0)
                 squelchNudge(Self.squelchStep, icon: "plus")
+                autoSquelchButton
             }
         }
+    }
+
+    /// Reads out the threshold normally, and the calibration's progress or
+    /// result while one is running. Showing the measured floor alongside the
+    /// value it chose keeps the automatic behaviour inspectable — the whole
+    /// point is that the meter and the gate share a scale, so seeing both makes
+    /// the number meaningful rather than magic.
+    @ViewBuilder
+    private var squelchStatus: some View {
+        if let cal = vm.calibration {
+            if let done = cal.finished {
+                Text(String(format: "floor %.0f → set %.1f dB", done.noiseFloorDb, done.thresholdDb))
+                    .font(.caption).monospacedDigit().foregroundStyle(.tint)
+            } else {
+                Text("Measuring noise floor… \(cal.secondsRemaining)s")
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
+        } else {
+            // One decimal: the value was always fractional, the readout just
+            // hid it by rounding to Int.
+            Text(String(format: "%.1f dB", vm.squelchDb))
+                .font(.caption).monospacedDigit()
+        }
+    }
+
+    private var autoSquelchButton: some View {
+        Button {
+            if vm.calibration == nil {
+                vm.autoSquelch()
+            } else {
+                vm.cancelCalibration()
+            }
+        } label: {
+            Group {
+                if vm.calibration?.finished == nil, vm.calibration != nil {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text("Auto").font(.caption.weight(.semibold))
+                }
+            }
+            .frame(width: 44, height: 30)
+            .background(Color(.tertiarySystemFill), in: .capsule)
+        }
+        .buttonStyle(.plain)
+        .disabled(vm.state != .connected)
+        .accessibilityLabel("Set squelch automatically")
     }
 
     private func squelchNudge(_ delta: Float, icon: String) -> some View {
