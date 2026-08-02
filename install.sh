@@ -145,6 +145,22 @@ HOOKEOF
         echo "==> /etc/narrowcast/certs/server.crt already exists — leaving untouched."
     fi
 
+    if [ ! -f /etc/narrowcast/narrowcast.env ]; then
+        sudo tee /etc/narrowcast/narrowcast.env > /dev/null <<'ARGSEOF'
+# Extra flags for the narrowcast SDR server, all on one line. Applied on
+# restart, so tuning by ear does not mean editing the systemd unit:
+#
+#   NARROWCAST_ARGS="-am-bandwidth 2500 -am-presence 3"
+#
+# Run `narrowcast --help` for the full list. Leave empty for defaults.
+NARROWCAST_ARGS=""
+ARGSEOF
+        sudo chown narrowcast:narrowcast /etc/narrowcast/narrowcast.env
+        echo "==> Created /etc/narrowcast/narrowcast.env (tuning flags)"
+    else
+        echo "==> /etc/narrowcast/narrowcast.env already exists — leaving untouched."
+    fi
+
     if [ ! -f /etc/narrowcast/uplink.env ]; then
         echo ""
         echo "Uplink connects to the relay over the public network."

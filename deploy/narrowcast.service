@@ -4,9 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
+# Optional tuning flags, one line: NARROWCAST_ARGS="-am-bandwidth 2500".
+# The leading - means a missing file is not an error, so upgrading an install
+# that predates this file still starts. Unquoted $NARROWCAST_ARGS is
+# deliberate: systemd word-splits that form, which is what allows several
+# flags in one variable.
+EnvironmentFile=-/etc/narrowcast/narrowcast.env
 ExecStart=/usr/local/bin/narrowcast \
     -cert /etc/narrowcast/certs/server.crt \
-    -key /etc/narrowcast/certs/server.key
+    -key /etc/narrowcast/certs/server.key \
+    $NARROWCAST_ARGS
 WorkingDirectory=/etc/narrowcast
 Restart=always
 RestartSec=3
